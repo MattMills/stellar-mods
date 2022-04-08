@@ -9,7 +9,7 @@ from datetime import datetime
 import os
 
 
-url = 'https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/'
+url = 'http://api.steampowered.com/IPublishedFileService/QueryFiles/v1/' #Getting weird TLS errors, don't need TLS anyway
 
 params = {}
 
@@ -28,10 +28,11 @@ params['return_tags']       = True
 params['return_previews']   = True
 params['return_metadata']   = True
 
+
 output_dir = 'steam_workshop_data/%s/%s' % (params['app_id'], datetime.utcnow().isoformat())
 
 try:
-    os.mkdir(output_dir)
+    os.makedirs(output_dir)
 except:
     pass
 
