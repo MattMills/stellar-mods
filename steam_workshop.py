@@ -52,7 +52,7 @@ while(params['cursor'] != last_cursor):
     last_cursor = params['cursor']
     params['cursor'] = json_result['response']['next_cursor']
     iterator = iterator + 1
-    print('[%s]: (%s/%s) %s\n' % (datetime.utcnow().isoformat(), iterator, params['cursor'], result.status_code))
+    print('[%s]: (%s/%s) %s' % (datetime.utcnow().isoformat(), iterator, params['cursor'], result.status_code))
     time.sleep(1)
    
 
