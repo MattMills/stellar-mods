@@ -1,2 +1,4 @@
 depotdownloader/
-
+ingest_logs/
+steam_workshop_data/
+archive_steam_workshop_data/
