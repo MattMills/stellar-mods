@@ -8,12 +8,16 @@ import sys
 
 
 
+if len(sys.argv) < 2 or not os.path.isdir(sys.argv[2]):
+    print("Error: invalid argument syntax")
+    exit()
 
+parse_dir = sys.argv[2]
 
 #parse_dir = 'steam_workshop_data/281990/2022-04-07T00:20:52.551535/' #temporary variable, should be passed on command line to currently processing dir of json files.
 #parse_dir = 'steam_workshop_data/281990/2022-04-07T11:59:26.826724/'
 #parse_dir = 'steam_workshop_data/281990/2022-04-07T19:10:32.985600'
-parse_dir = 'steam_workshop_data/281990/2022-04-08T03:04:30.773086/'
+#parse_dir = 'steam_workshop_data/281990/2022-04-08T03:04:30.773086/'
 
 if parse_dir[:-1] != '/':
     parse_dir += '/'
