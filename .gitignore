@@ -2,3 +2,6 @@ depotdownloader/
 ingest_logs/
 steam_workshop_data/
 archive_steam_workshop_data/
+finished_mods/
+finished_previews/
+logs/
