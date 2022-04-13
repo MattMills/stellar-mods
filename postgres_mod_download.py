@@ -114,7 +114,7 @@ cur.execute(
         '   select uuid as mod_uuid from ('
         '    select distinct ON (publishedfileid) uuid from mods  order by publishedfileid, revision_change_number desc'
         '    ) as active_mods'
-        '   ) limit 1'
+        '   )'
         );
 
 
@@ -146,14 +146,16 @@ stats['archive_count'] = 0
 #Depot 281990 - Downloaded 53648 bytes (295673 bytes uncompressed)\n
 #Total downloaded: 53648 bytes (295673 bytes uncompressed) from 1 depots\nDisconnected from Steam\n', stderr=b'')
 
-regex_files_pre = re.compile(r"Pre-allocating ([^\s]+)")
-regex_files_existing = re.compile(r"Validating ([^\s]+)")
+regex_files_pre = re.compile(r"Pre-allocating ([^\n]+)")
+regex_files_existing = re.compile(r"Validating ([^\n]+)")
 regex_file_parts = re.compile(r"depots/([^/]+)/([^/]+)/([^\n]+)")
 
 regex_manifest_date = re.compile(r"Manifest ([^\s]+) ([^\n]+)")
 regex_total_bytes = re.compile(r"Total downloaded: ([^\n]+)")
 
 for mod_detail in  cur:
+    error_flag = False
+
     command = ['dotnet', '/opt/depotdownloader/DepotDownloader.dll', '-app', '%s' % mod_detail['creator_appid'], '-pubfile', '%s' % mod_detail['publishedfileid'],'-validate']
     output = subprocess.run(command, capture_output=True)
     stdout = output.stdout.decode("utf-8")
@@ -218,9 +220,12 @@ for mod_detail in  cur:
 
     logging.info('Mod depot download: App: %s pubfileid: %s rc: %s files_new: %s files_existing: %s manifest_id: %s manifest_date: %s, total_bytes: %s depotdir: %s'
                     % ( mod_detail['creator_appid'], mod_detail['publishedfileid'], output.returncode, len(files_pre), len(files_existing), manifest_id, manifest_datestamp, total_bytes, depotdir))
-
-    parsed_datestamp = datetime.strptime(manifest_datestamp, '(%m/%d/%Y %I:%M:%S %p)')
-    updated_time = time.mktime(parsed_datestamp.timetuple())
+    try:
+        parsed_datestamp = datetime.strptime(manifest_datestamp, '(%m/%d/%Y %I:%M:%S %p)')
+        updated_time = time.mktime(parsed_datestamp.timetuple())
+    except: 
+        log.error('Error updating timestamp')
+        error_flag = True
 
     finished_dir = 'finished_mods/%s/%s/' % (mod_detail['creator_appid'], mod_detail['mod_uuid'])
 
@@ -233,19 +238,29 @@ for mod_detail in  cur:
     for filename in files_all:
         os.utime(filename, (updated_time, updated_time))
 
+
     if len(files_all) == 1 and files_all[0][-4:].lower() == '.zip':
         #Entire mod is already zipped, use existing rather than re-zipping.
         shutil.move(files_all[0], finished_dir)
+    elif depotdir == None or not os.path.isdir(depotdir):
+        log.error("Depotdir doesn't exist, download failed?")
+        error_flag = True
     else:
-        zip_file_name = '%s/%s_%s_%s.zip' % (finished_dir, mod_detail['creator_appid'], mod_detail['publishedfileid'], mod_detail['revision_change_number'])
-
         prev_dir = os.getcwd()
-        os.chdir(depotdir)
-        command = ['zip', '-JXDor' ,'-x.DepotDownloader', zip_file_name, './']
-        output = subprocess.run(command, capture_output=True)
-        os.chdir(prevdir)
+        zip_file_name = '%s/%s/%s_%s_%s.zip' % (prev_dir, finished_dir, mod_detail['creator_appid'], mod_detail['publishedfileid'], mod_detail['revision_change_number'])
+        if os.path.exists(zip_file_name):
+            log.error('Finished zip file already exists %s' % (zip_file_name,))
+            error_flag = True
 
-        logging.info('Created zip for App: %s pubfileid: %s rc: %s' % (mod_detail['creator_appid'], mod_detail['publishedfileid'], )
+        os.chdir(depotdir)
+        command = ['zip', '-JXDor' , zip_file_name, './', '-x', '.DepotDownloader', '.DepotDownloader/*']
+        output = subprocess.run(command, capture_output=True)
+        os.chdir(prev_dir)
+
+        logging.info('Created zip for App: %s pubfileid: %s rc: %s' % (mod_detail['creator_appid'], mod_detail['publishedfileid'], output.returncode))
+        if(output.returncode != 0):
+            log.warning('Non zero returncode for zip')
+            error_flag = True
 
     
     for filename in glob.glob(r'%s/manifest_*.txt' % (depotdir,)):
@@ -253,6 +268,7 @@ for mod_detail in  cur:
             shutil.move(filename, finished_dir)
         except:
             log.error('Error moving file %s from %s to %s' % (filename, depotdir, finished_dir))
+            error_flag = True
 
     hash_list = []
     for filename in glob.glob(r'%s/*' % (finished_dir,)):
@@ -260,11 +276,18 @@ for mod_detail in  cur:
         hashes['file'] = hashes['file'][len(finished_dir)]
         hash_list.append(hashes)
 
-    stats['archive_count'] += 1
+    if(len(hash_list) == 2 and error_flag == False):
+        stats['archive_count'] += 1
+        cur2.execute('update files set file_time=%s, fetch_time=now(), hashes=%s where uuid=%s', (parsed_datestamp, hash_list, mod_detail['file_uuid']))
+    else:
+        log.warning('Error flag is set or hash size not right, App: %s pubfileid: %s not updated' % (mod_detail['creator_appid'], mod_detail['publishedfileid']))
+        shutil.rmtree(finished_dir)
 
-    cur2.execute('update files set file_time=%s, fetch_time=now(), hashes=%s where uuid=%s', (parsed_datestamp, hash_list, mod_detail['file_uuid']))
     dbh.commit()
-    shutil.rmtree(depotdir)
+    try:
+        shutil.rmtree(depotdir)
+    except:
+        log.warning("Failed to cleanup Depotdir")
 
 
 logging.info('Parse stats: %s' % (stats))
