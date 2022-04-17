@@ -114,6 +114,8 @@ cur.execute(
         '  fetch_time is null and '
         '  file_url is not null and '
         "  type != 'preview_type_1' and " 
+        "  type != 'preview_type_2' and "
+        "  files.last_seen > now()- INTERVAL '6 hours' and "
         '  mod_uuid in ('
         '   select uuid as mod_uuid from ('
         '    select distinct ON (publishedfileid) uuid from mods  order by publishedfileid, revision_change_number desc'
@@ -164,7 +166,6 @@ session.mount('https://', adapter)
 
 for file_detail in  cur:
     error_flag = False
-
     finished_dir = 'finished_previews/%s/%s/%s/' % (file_detail['creator_appid'], file_detail['mod_uuid'], file_detail['revision_change_number'])
     file_path = '%s/%s' % (finished_dir, file_detail['file_uuid'])
     file_head = '%s.head' % (file_path,)
@@ -177,8 +178,13 @@ for file_detail in  cur:
     if os.path.isfile(file_path):
         #TODO: If-Not-Modified w/ etag, but we should limit revisit frequency
         stats['existing_file_count'] += 1
+        log.info('Existing file: %s, mod: %s publishedfileid: %s steamid: %s' % (file_detail['file_uuid'], file_detail['mod_uuid'], file_detail['publishedfileid'], file_detail['steam_id']))
     else:
-        request = session.get(file_detail['file_url'])
+        try:
+            request = session.get(file_detail['file_url'])
+        except:
+            log.error('File %s, publishedfileid %s, steamid: %s has no URL' % (file_detail['file_uuid'], file_detail['publishedfileid'], file_detail['steam_id']))
+            continue
         if request.status_code == requests.codes.ok:
             #TODO: Check content-length and content-md5
             with open(file_path, 'wb') as fh:
@@ -211,7 +217,11 @@ for file_detail in  cur:
             cur2.execute('update files set file_time=%s, fetch_time=now(), hashes=%s where uuid=%s', (parsed_datestamp, hashes, file_detail['file_uuid']))
         else:
             log.warning('Error flag is set , App: %s pubfileid: %s file_uuid %s not updated' % (file_detail['creator_appid'], file_detail['publishedfileid'], file_detail['file_uuid']))
-            os.unlink(file_path)
+            try:
+                os.unlink(file_path)
+            except:
+                log.warning('Error deleting file %s' % (file_path))
+                pass
 
     dbh.commit()
 

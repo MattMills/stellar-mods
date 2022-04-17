@@ -241,7 +241,12 @@ for mod_detail in  cur:
 
     if len(files_all) == 1 and files_all[0][-4:].lower() == '.zip':
         #Entire mod is already zipped, use existing rather than re-zipping.
-        shutil.move(files_all[0], finished_dir)
+        try:
+            shutil.move(files_all[0], finished_dir)
+        except Exception as e:
+            log.error('Finished mod zip file already exists %s %s %s' % (zip_file_name, e, type(e)))
+            error_flag = True
+
     elif depotdir == None or not os.path.isdir(depotdir):
         log.error("Depotdir doesn't exist, download failed?")
         error_flag = True
