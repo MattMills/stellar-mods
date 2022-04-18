@@ -109,16 +109,17 @@ cur.execute(
         '  join mods on (mod_uuid = mods.uuid)'
         ' where '
         "  type = 'hcontent_file' and "
-        '  fetch_time is null and '
-        '  mod_uuid in ('
-        '   select uuid as mod_uuid from ('
-        '    select distinct ON (publishedfileid) uuid from mods  order by publishedfileid, revision_change_number desc'
-        '    ) as active_mods'
-        '   )'
+        '  fetch_time is null'
+
+        #'  mod_uuid in ('
+        #'   select uuid as mod_uuid from ('
+        #'    select distinct ON (publishedfileid) uuid from mods  order by publishedfileid, revision_change_number desc'
+        #'    ) as active_mods'
+        #'   )'
         );
 
 
-
+log.info('Got %s rows from database' % (cur.rowcount, ))
 
 #init stats variables
 stats = {}
@@ -155,8 +156,10 @@ regex_total_bytes = re.compile(r"Total downloaded: ([^\n]+)")
 
 for mod_detail in  cur:
     error_flag = False
-
-    command = ['dotnet', '/opt/depotdownloader/DepotDownloader.dll', '-app', '%s' % mod_detail['creator_appid'], '-pubfile', '%s' % mod_detail['publishedfileid'],'-validate']
+    command = ['dotnet', '/opt/depotdownloader/DepotDownloader.dll', 
+            '-app', '%s' % mod_detail['creator_appid'], 
+            '-ugc', '%s' % mod_detail['steam_id'],
+            ]
     output = subprocess.run(command, capture_output=True)
     stdout = output.stdout.decode("utf-8")
     stderr = output.stderr.decode("utf-8")
