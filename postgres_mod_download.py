@@ -41,7 +41,11 @@ start_time = datetime.now()
 
 # Setup logging
 try:
-    os.makedirs('mod_dl_logs/depotdownloader/')
+    os.makedirs('logs/depotdownloader/')
+except:
+    pass
+try:
+    os.makedirs('logs/mod_download/')
 except:
     pass
 
@@ -60,7 +64,7 @@ class msecFormatter(logging.Formatter):
 
 log_formatter = msecFormatter(fmt='[%(asctime)s] (%(levelname)s): %(message)s')
 
-log_file_handler = logging.FileHandler('mod_dl_logs/%s.log' % (start_time,), )
+log_file_handler = logging.FileHandler('logs/mod_download/%s.log' % (start_time,), )
 log_file_handler.setLevel(logging.INFO)
 log_file_handler.setFormatter(log_formatter)
 
@@ -212,12 +216,12 @@ for mod_detail in  cur:
     mod_download_detail = '%s Mod depot download: App: %s pubfileid: %s rc: %s files_new: %s files_existing: %s manifest_id: %s manifest_date: %s, total_bytes: %s\n' % (datetime.now(), mod_detail['creator_appid'], mod_detail['publishedfileid'], output.returncode, len(files_pre), len(files_existing), manifest_id, manifest_datestamp, total_bytes)
     mod_download_detail = mod_download_detail.encode('utf-8')
     if len(stdout) > 0:
-        with gzip.open('mod_dl_logs/depotdownloader/%s_%s.stdout.gz' % (mod_detail['creator_appid'], mod_detail['publishedfileid']), 'a') as fh:
+        with gzip.open('logs/depotdownloader/%s_%s.stdout.gz' % (mod_detail['creator_appid'], mod_detail['publishedfileid']), 'a') as fh:
             fh.write(mod_download_detail)
             fh.write(output.stdout)
 
     if len(stderr) > 0:
-        with gzip.open('mod_dl_logs/depotdownloader/%s_%s.stderr.gz' % (mod_detail['creator_appid'], mod_detail['publishedfileid']), 'a') as fh:
+        with gzip.open('logs/depotdownloader/%s_%s.stderr.gz' % (mod_detail['creator_appid'], mod_detail['publishedfileid']), 'a') as fh:
             fh.write(mod_download_detail)
             fh.write(output.stderr)
 

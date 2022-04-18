@@ -30,7 +30,7 @@ steam_default_hcontent_preview = '18446744073709551615'
 
 # Setup logging
 try:
-    os.makedirs('ingest_logs')
+    os.makedirs('logs/metadata_ingest/')
 except:
     pass
 
@@ -49,7 +49,7 @@ class msecFormatter(logging.Formatter):
 
 log_formatter = msecFormatter(fmt='[%(asctime)s] (%(levelname)s): %(message)s')
 
-log_file_handler = logging.FileHandler('ingest_logs/%s.log' % (start_time,), )
+log_file_handler = logging.FileHandler('logs/metadata_ingest/%s.log' % (start_time,), )
 log_file_handler.setLevel(logging.INFO)
 log_file_handler.setFormatter(log_formatter)
 
