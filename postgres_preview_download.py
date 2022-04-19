@@ -113,14 +113,15 @@ cur.execute(
         "  type != 'hcontent_file' and "
         '  fetch_time is null and '
         '  file_url is not null and '
+        "  file_url != '' and"
         "  type != 'preview_type_1' and " 
         "  type != 'preview_type_2' and "
-        "  files.last_seen > now()- INTERVAL '6 hours' and "
-        '  mod_uuid in ('
-        '   select uuid as mod_uuid from ('
-        '    select distinct ON (publishedfileid) uuid from mods  order by publishedfileid, revision_change_number desc'
-        '    ) as active_mods'
-        '   )'
+        "  files.last_seen > now()- INTERVAL '7 days'"
+        #'  mod_uuid in ('
+        #'   select uuid as mod_uuid from ('
+        #'    select distinct ON (publishedfileid) uuid from mods  order by publishedfileid, revision_change_number desc'
+        #'    ) as active_mods'
+        #'   )'
         );#preview_type_1 == youtube
 
 
