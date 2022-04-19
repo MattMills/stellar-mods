@@ -256,9 +256,13 @@ for filename in os.listdir(parse_dir):
                 if 'previews' in file_details:
                         for preview in file_details['previews']:
                             try:
-                                if 'youtubevideoid' in preview:
+                                if preview['preview_type'] == 1:
                                     preview['filename'] = preview['youtubevideoid']
                                     preview['url'] = 'https://www.youtube.com/watch?v=%s' % (preview['youtubevideoid'],)
+                                    preview['size'] = 0
+                                elif preview['preview_type'] == 2:
+                                    preview['filename'] = preview['external_reference']
+                                    preview['url'] = 'https://sketchfab.com/3d-models/%s' % (preview['external_reference'],)
                                     preview['size'] = 0
                                 sql_statement_files += cur.mogrify((
                                     '('
