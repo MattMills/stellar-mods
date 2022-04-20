@@ -19,9 +19,10 @@ do
 	mkdir -p $ARCHIVE_SUFFIX$DATA_FOLDER$APPID/
 	zip -r -m -9 -o -D $ARCHIVE_SUFFIX$DATA_FOLDER$APPID/$BASENAME.zip $JUST_FOLDER
 	find steam_workshop_data/ -iname '*-*-*T*:*:*.*' -type d -empty -delete
-	python3 ./postgres_preview_download.py 
-	python3 ./postgres_mod_download.py 
-	python3 ./postgres_mod_filelist_load.py
-	python3 ./postgres_mod_stats_refresh.py 
 done
+
+python3 ./postgres_preview_download.py
+python3 ./postgres_mod_download.py
+python3 ./postgres_mod_filelist_load.py
+python3 ./postgres_mod_stats_refresh.py
 
