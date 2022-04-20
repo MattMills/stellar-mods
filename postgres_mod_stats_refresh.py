@@ -56,10 +56,10 @@ psycopg2.extensions.register_adapter(tuple, psycopg2.extras.Json)
 cur.execute(
 
 'insert into mod_stats_summary_daily '
-'(start_time, end_time, mod_uuid, num_comments_public, subscriptions, favorited, followers, lifetime_subscriptions, lifetime_favorited, lifetime_followers, views, num_children, num_reports, votes_score, votes_up, votes_down) ' 
+'(start_time, end_time, publishedfileid, num_comments_public, subscriptions, favorited, followers, lifetime_subscriptions, lifetime_favorited, lifetime_followers, views, num_children, num_reports, votes_score, votes_up, votes_down) ' 
 'with daily_interval as ( '
-"select end_time - '1 day'::interval as start_time, end_time from ( "
-" SELECT date_trunc('day', last_day) as end_time "
+"select start_time, start_time + '1 day'::interval as end_time from ( "
+" SELECT date_trunc('day', last_day) as start_time "
 '  FROM generate_series( ' 
 '   ( '
 '    coalesce( '
@@ -74,7 +74,7 @@ cur.execute(
 ') as start_times ) '
 'select '
 '  p.start_time as start_time, p.end_time as end_time, '
-'  m.mod_uuid as mod_uuid, '
+'  mods.publishedfileid as publishedfileid, '
 '  coalesce(max(m.num_comments_public)-min(m.num_comments_public), 0) as num_comments_public, '
 '  coalesce(max(m.subscriptions)-min(m.subscriptions), 0) as subscriptions, '
 '  coalesce(max(m.favorited)-min(m.favorited), 0) as favorited, '
@@ -90,10 +90,11 @@ cur.execute(
 '  coalesce(max(m.votes_down)-min(m.votes_down), 0) as votes_down '
 'from mod_stats m '
 ' right join daily_interval p on (m.timestamp >= p.start_time and m.timestamp <= p.end_time) '
-' where m.mod_uuid is not null '
-' group by p.start_time, p.end_time, mod_uuid '
+' join mods on (mods.uuid = m.mod_uuid) '
+' where mods.publishedfileid is not null '
+' group by p.start_time, p.end_time, mods.publishedfileid '
 ' order by p.start_time '
-'  on conflict on constraint mod_stats_period_mod_uuid_constraint '
+'  on conflict on constraint mod_stats_period_publishedfileid_constraint '
 ' do update set '
 '   num_comments_public = EXCLUDED.num_comments_public, '
 '   subscriptions = EXCLUDED.subscriptions, '
@@ -110,5 +111,64 @@ cur.execute(
 
 dbh.commit()
 log.info('Postgres mod stats daily summary refresh start - Rows: %s' % ( cur.rowcount))
+log.info('Postgres mod stats 7 day summary refresh start')
+cur.execute(
+
+'insert into mod_stats_summary_7day '
+'(start_time, end_time, publishedfileid, num_comments_public, subscriptions, favorited, followers, lifetime_subscriptions, lifetime_favorited, lifetime_followers, views, num_children, num_reports, votes_score, votes_up, votes_down) '
+'with day7_interval as ( '
+"select start_time, start_time + '7 days'::interval as end_time from ( "
+" SELECT date_trunc('day', last_7day) as start_time "
+'  FROM generate_series( '
+'   ( '
+'    coalesce( '
+"     (select max(start_time) - '7 days'::interval as timestamp from mod_stats_summary_7day), "
+'     (select min(timestamp) from mod_stats), '
+"     (select  now() - '7 days'::interval as timestamp) "
+'    ) '
+'   ), '
+'   (select max(timestamp) from mod_stats), '
+"   '7 day':: interval "
+') last_7day '
+') as start_times ) '
+'select '
+'  p.start_time as start_time, p.end_time as end_time, '
+'  mods.publishedfileid as publishedfileid, '
+'  coalesce(max(m.num_comments_public)-min(m.num_comments_public), 0) as num_comments_public, '
+'  coalesce(max(m.subscriptions)-min(m.subscriptions), 0) as subscriptions, '
+'  coalesce(max(m.favorited)-min(m.favorited), 0) as favorited, '
+'  coalesce(max(m.followers)-min(m.followers), 0) as followers, '
+'  coalesce(max(m.lifetime_subscriptions)-min(m.lifetime_subscriptions), 0) as lifetime_subscriptions, '
+'  coalesce(max(m.lifetime_favorited)-min(m.lifetime_favorited), 0) as lifetime_favorited, '
+'  coalesce(max(m.lifetime_followers)-min(m.lifetime_followers), 0) as lifetime_followers, '
+'  coalesce(max(m.views)-min(m.views), 0) as views, '
+'  coalesce(max(m.num_children)-min(m.num_children), 0) as num_children, '
+'  coalesce(max(m.num_reports)-min(m.num_reports), 0) as num_reports, '
+'  coalesce(max(m.votes_score)-min(m.votes_score), 0) as votes_score, '
+'  coalesce(max(m.votes_up)-min(m.votes_up), 0) as votes_up, '
+'  coalesce(max(m.votes_down)-min(m.votes_down), 0) as votes_down '
+'from mod_stats m '
+' right join day7_interval p on (m.timestamp >= p.start_time and m.timestamp <= p.end_time) '
+' join mods on (mods.uuid = m.mod_uuid) '
+' where mods.publishedfileid is not null '
+' group by p.start_time, p.end_time, mods.publishedfileid '
+' order by p.start_time '
+'  on conflict on constraint mod_stats_summary_7day_start_time_end_time_publishedfileid_key '
+' do update set '
+'   num_comments_public = EXCLUDED.num_comments_public, '
+'   subscriptions = EXCLUDED.subscriptions, '
+'   favorited = EXCLUDED.favorited, '
+'   followers = EXCLUDED.followers, '
+'   lifetime_subscriptions = EXCLUDED.lifetime_subscriptions, '
+'   lifetime_followers = EXCLUDED.lifetime_followers, '
+'   views = EXCLUDED.views, '
+'   num_children = EXCLUDED.num_children, '
+'   votes_score = EXCLUDED.votes_score, '
+'   votes_up = EXCLUDED.votes_up, '
+'   votes_down = EXCLUDED.votes_down '
+        );
+dbh.commit()
+log.info('Postgres mod stats 7 day summary refresh start - Rows: %s' % ( cur.rowcount))
+
 cur.close()
 dbh.close()
