@@ -161,7 +161,7 @@ regex_total_bytes = re.compile(r"Total downloaded: ([^\n]+)")
 
 for mod_detail in  cur:
     error_flag = False
-    command = ['dotnet', '/opt/depotdownloader/DepotDownloader.dll', 
+    command = ['/snap/bin/dotnet', '/opt/depotdownloader/DepotDownloader.dll', 
             '-app', '%s' % mod_detail['creator_appid'], 
             '-ugc', '%s' % mod_detail['steam_id'],
             ]
