@@ -4,6 +4,15 @@ DATA_FOLDER='steam_workshop_data/'
 ARCHIVE_SUFFIX='archive_'
 cd /zpool0/share/stellar-mods/
 
+
+
+if { set -C; 2>/dev/null > run_periodic_ingest.lock; }; then
+	trap "rm -f run_periodic_ingest.lock" EXIT
+else
+	echo "Lock file exists... script already running?"
+	exit
+fi
+
 . /opt/esp/esp-idf/export.sh
 echo "Fetching data from Steam workshop"
 python3 steam_workshop.py
