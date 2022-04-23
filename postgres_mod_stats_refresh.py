@@ -3,13 +3,16 @@ import os
 from zipfile import ZipFile
 import logging
 import json
+import sys
 import psycopg2
 import psycopg2.extras
 
 
+script_name = sys.argv[0]
+
 start_time = datetime.now()
 
-log_folder = 'logs/postgres_mod_stats_refresh/'
+log_folder = 'logs/%s/' % (script_name, )
 
 # Setup logging
 try:
@@ -118,17 +121,17 @@ cur.execute(
 '(start_time, end_time, publishedfileid, num_comments_public, subscriptions, favorited, followers, lifetime_subscriptions, lifetime_favorited, lifetime_followers, views, num_children, num_reports, votes_score, votes_up, votes_down) '
 'with day7_interval as ( '
 "select start_time, start_time + '7 days'::interval as end_time from ( "
-" SELECT date_trunc('day', last_7day) as start_time "
+" SELECT date_trunc('hour', last_7day) as start_time "
 '  FROM generate_series( '
 '   ( '
 '    coalesce( '
-"     (select max(start_time) - '7 days'::interval as timestamp from mod_stats_summary_7day), "
-'     (select min(timestamp) from mod_stats), '
-"     (select  now() - '7 days'::interval as timestamp) "
+"     (select max(start_time) as timestamp from mod_stats_summary_7day), "  # Use max(start_time) from mod_stats_summary_7day if it is populated with data
+'     (select min(timestamp) from mod_stats), '                             # If not, use the minimum timestamp from mod_stats, since the summary table is empty
+"     (select  now() - '7 days'::interval as timestamp) "                   # Else start a week ago for sanity (dunno why it'd ever hit this)
 '    ) '
 '   ), '
-'   (select max(timestamp) from mod_stats), '
-"   '7 day':: interval "
+"   (select max(timestamp) - '7 days'::interval from mod_stats), "                               # Up to our latest data
+"   '1 hour':: interval "
 ') last_7day '
 ') as start_times ) '
 'select '
@@ -169,6 +172,29 @@ cur.execute(
         );
 dbh.commit()
 log.info('Postgres mod stats 7 day summary refresh start - Rows: %s' % ( cur.rowcount))
+import platform
+import sys
+import os
+config_metadata = {
+    'host': platform.node(),
+    'python_version': platform.python_version(),
+    'user': os.getlogin(),
+    'argv': sys.argv,
+    'pid' : os.getpid(),
+}
+
+cur.execute(
+    'insert into ingest_event '
+    '(start_timestamp, end_timestamp, stats, type, config_metadata) '
+    'values ( %s, %s, %s, %s, %s)',
+    (start_time, datetime.now(), stats, script_name, config_metadata)
+)
+
+
+
+
+dbh.commit()
+
 
 cur.close()
 dbh.close()
