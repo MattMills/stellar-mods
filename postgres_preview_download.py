@@ -15,6 +15,7 @@ import json
 import requests
 #import zipfile
 
+script_name = sys.argv[0]
 
 def get_hashes(filename):
         md5 = hashlib.md5()
@@ -43,7 +44,7 @@ start_time = datetime.now()
 
 # Setup logging
 try:
-    os.makedirs('logs/preview_downloader/')
+    os.makedirs('logs/%s/' % (script_name, ))
 except:
     pass
 
@@ -62,7 +63,7 @@ class msecFormatter(logging.Formatter):
 
 log_formatter = msecFormatter(fmt='[%(asctime)s] (%(levelname)s): %(message)s')
 
-log_file_handler = logging.FileHandler('logs/preview_downloader/%s.log' % (start_time,), )
+log_file_handler = logging.FileHandler('logs/%s/%s.log' % (script_name, start_time,), )
 log_file_handler.setLevel(logging.INFO)
 log_file_handler.setFormatter(log_formatter)
 
@@ -228,6 +229,29 @@ for file_detail in  cur:
 
 
 logging.info('Parse stats: %s' % (stats))
+
+
+import platform
+import sys
+import os
+config_metadata = {
+        'host': platform.node(),
+        'python_version': platform.python_version(),
+        'user': os.getlogin(),
+        'argv': sys.argv,
+        'pid' : os.getpid(),
+            }
+
+cur.execute(
+        'insert into ingest_event '
+        '(start_timestamp, end_timestamp, stats, type, config_metadata) '
+        'values ( %s, %s, %s, %s, %s)',
+        (start_time, datetime.now(), stats, script_name, config_metadata)
+    )
+
+
+
+
 
 dbh.commit()
 cur.close()
