@@ -7,6 +7,8 @@ import logging
 import sys
 
 
+script_name = sys.argv[0]
+
 
 if len(sys.argv) < 2 or not os.path.isdir(sys.argv[2]):
     print("Error: invalid argument syntax")
@@ -30,7 +32,7 @@ steam_default_hcontent_preview = '18446744073709551615'
 
 # Setup logging
 try:
-    os.makedirs('logs/metadata_ingest/')
+    os.makedirs('logs/%s/' % (script_name,))
 except:
     pass
 
@@ -49,7 +51,7 @@ class msecFormatter(logging.Formatter):
 
 log_formatter = msecFormatter(fmt='[%(asctime)s] (%(levelname)s): %(message)s')
 
-log_file_handler = logging.FileHandler('logs/metadata_ingest/%s.log' % (start_time,), )
+log_file_handler = logging.FileHandler('logs/%s/%s.log' % (script_name, start_time,), )
 log_file_handler.setLevel(logging.INFO)
 log_file_handler.setFormatter(log_formatter)
 
@@ -60,7 +62,7 @@ log_console_handler.setFormatter(log_formatter)
 log.addHandler(log_file_handler)
 log.addHandler(log_console_handler)
 
-log.info('Steam workshop metadata ingest start (%s)' % parse_dir)
+log.info('%s start (%s)' % (script_name, parse_dir))
 
 
 
@@ -301,7 +303,26 @@ for filename in os.listdir(parse_dir):
 logging.info('All parsing complete: %s' % (parse_dir))
 logging.info('Parse stats: %s' % (stats))
 
-cur.execute('insert into ingest_event (folder, start_timestamp, end_timestamp, file_count, total_mod_count, existing_mod_count, existing_mod_update_count, failed_mod_count) values( %s, %s, %s, %s, %s, %s, %s, %s)', (parse_dir, start_time, datetime.now(), stats['file_count'], stats['total_mod_count'], stats['existing_mod_count'], stats['existing_mod_update_count'], stats['failed_mod_count']))
+import platform
+import sys
+import os
+config_metadata = {
+        'host': platform.node(),
+        'python_version': platform.python_version(),
+        'user': os.getlogin(),
+        'argv': sys.argv,
+        'pid' : os.getpid(),
+	'folder': parse_dir,
+            }
+
+cur.execute(
+        'insert into ingest_event '
+        '(start_timestamp, end_timestamp, stats, type, config_metadata) '
+        'values ( %s, %s, %s, %s, %s)',
+        (start_time, datetime.now(), stats, script_name, config_metadata)
+    )
+
+
 
 dbh.commit()
 cur.close()

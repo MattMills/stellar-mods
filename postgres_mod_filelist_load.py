@@ -5,11 +5,14 @@ import logging
 import json
 import psycopg2
 import psycopg2.extras
+import sys
+
+script_name = sys.argv[0]
 
 
 start_time = datetime.now()
 
-log_folder = 'logs/postgres_mod_filelist_ingest/'
+log_folder = 'logs/%s/' % (script_name,)
 
 # Setup logging
 try:
@@ -122,3 +125,27 @@ for appid in dirs:
                     finally:
                         dbh.commit()
 log.info(stats)
+
+import platform
+import sys
+import os
+config_metadata = {
+        'host': platform.node(),
+        'python_version': platform.python_version(),
+        'user': os.getlogin(),
+        'argv': sys.argv,
+        'pid' : os.getpid(),
+            }
+
+cur.execute(
+        'insert into ingest_event '
+        '(start_timestamp, end_timestamp, stats, type, config_metadata) '
+        'values ( %s, %s, %s, %s, %s)',
+        (start_time, datetime.now(), stats, script_name, config_metadata)
+    )
+
+
+dbh.commit()
+cur.close()
+dbh.close()
+
