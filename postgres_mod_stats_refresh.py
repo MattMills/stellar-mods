@@ -55,6 +55,9 @@ cur2 = dbh.cursor() #used for updates
 psycopg2.extensions.register_adapter(dict, psycopg2.extras.Json)
 psycopg2.extensions.register_adapter(list, psycopg2.extras.Json)
 psycopg2.extensions.register_adapter(tuple, psycopg2.extras.Json)
+stats = {}
+
+
 
 cur.execute(
 
@@ -113,6 +116,8 @@ cur.execute(
         );
 
 dbh.commit()
+
+stats['daily_rowcount'] = cur.rowcount
 log.info('Postgres mod stats daily summary refresh start - Rows: %s' % ( cur.rowcount))
 log.info('Postgres mod stats 7 day summary refresh start')
 cur.execute(
@@ -171,6 +176,8 @@ cur.execute(
 '   votes_down = EXCLUDED.votes_down '
         );
 dbh.commit()
+
+stats['7day_rowcount'] = cur.rowcount
 log.info('Postgres mod stats 7 day summary refresh start - Rows: %s' % ( cur.rowcount))
 import platform
 import sys
@@ -182,6 +189,7 @@ config_metadata = {
     'argv': sys.argv,
     'pid' : os.getpid(),
 }
+
 
 cur.execute(
     'insert into ingest_event '
