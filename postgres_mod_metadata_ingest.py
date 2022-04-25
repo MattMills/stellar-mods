@@ -1,4 +1,5 @@
 import psycopg2
+import psycopg2.extras
 import json
 import time
 from datetime import datetime
@@ -68,24 +69,24 @@ log.info('%s start (%s)' % (script_name, parse_dir))
 
 # Connect to Postgres
 dbh = psycopg2.connect("dbname=stellar-mods user=postgres") or logging.critical('Unable to connect to database');
-cur = dbh.cursor()
+cur = dbh.cursor(cursor_factory = psycopg2.extras.RealDictCursor) #results return associative dicts instead of tuples.
+psycopg2.extensions.register_adapter(dict, psycopg2.extras.Json)
+psycopg2.extensions.register_adapter(list, psycopg2.extras.Json)
+psycopg2.extensions.register_adapter(tuple, psycopg2.extras.Json)
 
 
 existing_mod_detail = {}
 seen_mod_detail = {}
 
 def refresh_existing_mod_detail():
-    cur.execute('select distinct ON (publishedfileid) uuid,publishedfileid,revision_change_number from mods  order by publishedfileid, revision_change_number desc');
+    cur.execute('select  uuid,publishedfileid,revision_change_number from mods  order by publishedfileid, revision_change_number desc');
 
     existing_mod_detail = {}
     for mod_detail in  cur.fetchall():
-        if mod_detail[1] in existing_mod_detail:
-            logging.critical('Duplicate mod publishedfileid detected in database - %s %s %s' % (mod_detail[1], existing_mod_detail[mod_detail[1]]['uuid'], mod_detail[0]))
-            exit(10);
-        existing_mod_detail[mod_detail[1]] = {}
-        existing_mod_detail[mod_detail[1]]['uuid'] = mod_detail[0]
-        existing_mod_detail[mod_detail[1]]['publishedfileid'] = mod_detail[1]
-        existing_mod_detail[mod_detail[1]]['revision_change_number'] = mod_detail[2]
+        if mod_detail['publishedfileid'] not in existing_mod_detail:
+            existing_mod_detail[mod_detail['publishedfileid']] = {}
+
+        existing_mod_detail[mod_detail['publishedfileid']][mod_detail['revision_change_number']] = mod_detail['uuid']
 
     return existing_mod_detail
 
@@ -93,7 +94,7 @@ def refresh_file_type_ids():
     cur.execute('select id, type from file_types');
     file_type_ids = {}
     for file_type in cur.fetchall():
-        file_type_ids[file_type[1]] = file_type[0]
+        file_type_ids[file_type['type']] = file_type['id']
 
     return file_type_ids
 
@@ -107,6 +108,7 @@ stats['total_mod_count'] = 0
 stats['file_mod_count'] = 0
 stats['existing_mod_count'] = 0
 stats['existing_mod_update_count'] = 0
+stats['existing_mod_new_revision_count'] = 0
 stats['failed_mod_count'] = 0
 
 for filename in os.listdir(parse_dir):
@@ -123,7 +125,7 @@ for filename in os.listdir(parse_dir):
                         'workshop_file, workshop_accepted, banned, ban_reason,'
                         'banner, can_be_deleted, file_type, can_subscribe,'
                         'language, maybe_inappropriate_sex, maybe_inappropriate_violence,'
-                        'revision_change_number, ban_text_check_result, title, our_time_updated'
+                        'revision_change_number, ban_text_check_result, title, our_time_updated, description, creator_steam_id'
                     ') values '
                     ).encode('utf-8')
 
@@ -157,9 +159,11 @@ for filename in os.listdir(parse_dir):
                 stats['file_mod_count'] += 1
                 if file_details['publishedfileid'] in existing_mod_detail: #mod already exists in DB
                     stats['existing_mod_count'] += 1
-                    if file_details['revision_change_number'] != existing_mod_detail[file_details['publishedfileid']]['revision_change_number']:
-                            #Update DB
-                            stats['existing_mod_update_count'] += 1
+                    if file_details['revision_change_number'] in existing_mod_detail[file_details['publishedfileid']]:
+                        #Update DB
+                        stats['existing_mod_update_count'] += 1
+                    else:
+                        stats['existing_mod_new_revision_count'] += 1
                 try:
                     file_details['visibility'] = bool(file_details['visibility'])
                     sql_statement_mods += cur.mogrify((
@@ -169,7 +173,7 @@ for filename in os.listdir(parse_dir):
                             '%(workshop_file)s, %(workshop_accepted)s, %(banned)s, %(ban_reason)s,'
                             '%(banner)s, %(can_be_deleted)s, %(file_type)s, %(can_subscribe)s,'
                             '%(language)s, %(maybe_inappropriate_sex)s, %(maybe_inappropriate_violence)s,'
-                            '%(revision_change_number)s, %(ban_text_check_result)s, %(title)s, %(parse_date)s'
+                            '%(revision_change_number)s, %(ban_text_check_result)s, %(title)s, %(parse_date)s, %(file_description)s, %(creator)s'
                         '),'
                     ), file_details)
                 except Exception as e:
@@ -203,6 +207,7 @@ for filename in os.listdir(parse_dir):
                     'title = EXCLUDED.title'
                 )
             cur.execute(sql_statement_mods)
+            dbh.commit()
 
             # if we've inserted any new uuids we need to get them before we can do stats and files on this input file, not super efficient but plenty fast for now.
             existing_mod_detail = refresh_existing_mod_detail()
@@ -210,9 +215,14 @@ for filename in os.listdir(parse_dir):
 
             for file_details in data['response']['publishedfiledetails']:
                 if file_details['publishedfileid'] not in existing_mod_detail:
+                    log.warning('Ignoring non-existing mod %s' % (file_details['publishedfileid'],))
                     continue #ignore anything not in DB by this point, as it's likely one of the failed mods above.
+                if file_details['revision_change_number'] not in existing_mod_detail[file_details['publishedfileid']]:
+                    log.warning('Ignoring non-existant mod revision %s %s' % (file_details['publishedfileid'], file_details['revision_change_number']))
+                    continue #If the mod exists but the revision doesn't, something goofy is going on
+                
                 file_details['parse_date'] = parse_date
-                file_details['mod_uuid'] = existing_mod_detail[file_details['publishedfileid']]['uuid']
+                file_details['mod_uuid'] = existing_mod_detail[file_details['publishedfileid']][file_details['revision_change_number']]
                 file_details['votes_score'] = file_details['vote_data']['score']
                 file_details['votes_up'] = file_details['vote_data']['votes_up']
                 file_details['votes_down'] = file_details['vote_data']['votes_down']
@@ -231,7 +241,7 @@ for filename in os.listdir(parse_dir):
                             '%(file_size)s, %(sort_order)s, %(steam_id)s'
                         '),'),
                         { 
-                            'mod_uuid': existing_mod_detail[file_details['publishedfileid']]['uuid'],
+                            'mod_uuid': existing_mod_detail[file_details['publishedfileid']][file_details['revision_change_number']],
                             'file_type': file_type_ids['hcontent_preview'],
                             'file_name': file_details['hcontent_preview'],
                             'file_url': file_details['preview_url'],
@@ -246,7 +256,7 @@ for filename in os.listdir(parse_dir):
                         '%(file_size)s, %(sort_order)s, %(steam_id)s'
                     '),'),
                     {
-                        'mod_uuid': existing_mod_detail[file_details['publishedfileid']]['uuid'],
+                        'mod_uuid': existing_mod_detail[file_details['publishedfileid']][file_details['revision_change_number']],
                         'file_type': file_type_ids['hcontent_file'],
                         'file_name': file_details['filename'],
                         'file_url': file_details['url'],
@@ -272,7 +282,7 @@ for filename in os.listdir(parse_dir):
                                         '%(file_size)s, %(sort_order)s, %(steam_id)s'
                                     '),'),
                                     {
-                                        'mod_uuid': existing_mod_detail[file_details['publishedfileid']]['uuid'],
+                                        'mod_uuid': existing_mod_detail[file_details['publishedfileid']][file_details['revision_change_number']],
                                         'file_type': file_type_ids['preview_type_%s' % preview['preview_type']],
                                         'file_name': preview['filename'],
                                         'file_url': preview['url'],
@@ -294,6 +304,7 @@ for filename in os.listdir(parse_dir):
             sql_statement_files = sql_statement_files[:-1] #remove last comma
             sql_statement_files += cur.mogrify(' ON CONFLICT ON CONSTRAINT file_uniqueness_constraint DO UPDATE SET last_seen = %s, delete_timestamp = null', (parse_date,))
             cur.execute(sql_statement_files)
+            dbh.commit()
 
         stats['total_mod_count'] += stats['file_mod_count']
         logging.info('(%s) %s - Parse complete (%s/%s)' % (stats['file_count'], full_filename, stats['file_mod_count'], stats['total_mod_count']))
