@@ -84,15 +84,6 @@ for appid in dirs:
 
                             for document in json_full_doc['response']['publishedfiledetails']:
                                 results = 0
-                                try:
-                                    result = es.search(index='mod-metadata-complete-index-v1', query={ 'match_phrase': {'name': zipped_file} })
-                                    if(result['hits']['total']['value'] > 0):
-                                        log.info('File already indexed, skipping - %s %s' % (zipfile, zipped_file,))
-                                        continue
-                                except Exception as e:                                    
-                                    log.warning('Exception in search: %s %s' % (type(e), e))
-                                    pass
-                                
                                 document['source_app_id'] = appid
                                 document['source_zip_file'] = zipfile
                                 document['source_zipped_file'] = zipped_file
