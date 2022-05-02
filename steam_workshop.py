@@ -14,7 +14,8 @@ url = 'http://api.steampowered.com/IPublishedFileService/QueryFiles/v1/' #Gettin
 params = {}
 
 # SECRET
-params['key']               = '' #Steam API key go here
+with open('SECRET_STEAM_API_KEY', 'r') as fh:
+        params['key'] = fh.read().strip()
 # SECRET
 
 params['query_type']        = 1 #https://steam.readthedocs.io/en/stable/api/steam.enums.html RankedByPublicationDate= 1
