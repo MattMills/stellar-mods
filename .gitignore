@@ -5,3 +5,4 @@ archive_steam_workshop_data/
 finished_mods/
 finished_previews/
 logs/
+SECRET_STEAM_API_KEY
