@@ -1,8 +1,8 @@
-from pprint import PrettyPrinter
-from zipfile import ZipFile, Path
+from zipfile import ZipFile, Path, BadZipFile
 import json
+import os
+import io
 
-pp = PrettyPrinter(width=10, indent=1)
 
 alpha_lower = 'abcdefghijklmnopqrstuvwxyz'
 alpha_upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -11,7 +11,7 @@ num = '0123456789'
 alpha = alpha_lower + alpha_upper
 alphanum = alpha + num
 
-non_control_special = '.:_-'
+non_control_special = '.:_-/!@$%^&*()'
 control_special = '{}="'
 comment = '#'
 newline = '\n\r'
@@ -26,8 +26,9 @@ class parser:
     # fh = file handle to open script file
     # enable_positional = Turn on/off source file position detail in output (prints x position from original file in state for each section, used for contextual highlighting)
 
-    def __init__(self, fh, enable_positional = True, enable_text = True):
+    def __init__(self, fh, file_size, enable_positional = True, enable_text = True):
         self.fh = fh
+        self.file_size = file_size
         self.enable_positional = enable_positional
         self.enable_text = enable_text
 
@@ -64,18 +65,63 @@ class parser:
         while True:
             while x < len(self.buf):
                 c = self.buf[x]
+
+                if len(local_buf) > 0 and self.comment == False and self.quote == False and self.assignment == False and c in whitespace+'}#':
+                    #this entire section is to support unquoted lists within {} ie, { a\nb\nc\n }
+                    x_backtrack = x
+                    while x_backtrack > 0 and self.buf[x_backtrack] in whitespace:
+                        x_backtrack -= 1
+
+                    x_forwardtrack = x
+                    while x_forwardtrack < len(self.buf)-1 and self.buf[x_forwardtrack] in whitespace:
+                        x_forwardtrack += 1
+
+                    if self.buf[x_backtrack] in all_non_control+'"{#' and self.buf[x_forwardtrack] != '=':
+                        local_buf_left = '__no_assignment__'
+                        if local_buf_left not in self.this_state:
+                            self.this_state[local_buf_left] = []
+
+                        self.this_state[local_buf_left].append((x, local_buf))
+                        local_buf = ''
+
                 if self.comment and c not in newline:
                     local_buf += c
                 elif c in control_special:
                     if c == '{':
                         self.depth += 1
-                        self.this_state[local_buf_left] = {}
+                        if local_buf_left not in self.this_state:
+                            try:
+                                self.this_state[local_buf_left] = []
+                            except:
+                                print('---------------------------------------')
+                                print(self.root_state)
+                                print(self.buf)
+                                print(local_buf_left)
+                                print('---------------------------------------')
+                                raise
+
                         self.state_chain.append(self.this_state)
                         self.this_state = self.this_state[local_buf_left]
+
+                        self.this_state.append({'__position__': x})
+                        self.state_chain.append(self.this_state)
+                        self.this_state = self.this_state[-1]
+
                         self.assignment = False
                     elif c == '}':
                         self.depth -= 1
-                        self.this_state = self.state_chain.pop()
+                        try:
+                            self.this_state = self.state_chain.pop()
+                        except IndexError  as e:
+                            if '__errors__' not in self.root_state:
+                                self.root_state['__errors__'] = []
+                            self.root_state['__errors__'].append('Unbalanced {}, (too many!), position: %s x: %s' % (self.fh_pos, x ))
+                            #print(self.root_state)
+                            #print(self.this_state)
+                            #print('%s %s' % (self.depth, self.max_depth))
+
+                        if type(self.this_state) != type(dict()): 
+                            self.this_state = self.state_chain.pop()
                     elif c == '=':
                         local_buf_left = local_buf
                         local_buf = ''
@@ -85,6 +131,7 @@ class parser:
                             self.quote = True
                         else:
                             if self.buf[x-1] == "\\":
+                                x += 1
                                 continue
                             #closing quote
                             self.quote = False
@@ -116,7 +163,7 @@ class parser:
                                 print('Exception: %s - %s' % (type(e), e))
                                 print(x)
                                 print(local_buf)
-                                print(self.buf)
+                                print(self.buf.rstrip())
                                 print(self.root_state)
                                 print(self.this_state)
                                 print('-----------------------------------------------')
@@ -139,15 +186,18 @@ class parser:
                     local_buf += c
 
 
+
                 if self.depth > self.max_depth:
                     self.max_depth = self.depth
-
+    
                 if self.max_depth == 0 and c == "\n" and x > 1:
                     self.max_depth += 1
 
-                if self.depth == 0 and self.max_depth != 0:
-
-                    section = self.buf[:x]
+                if (self.depth <= 0 and self.max_depth != 0): # or (x+self.fh_pos >= self.file_size) :
+                    #36 11 0 37
+                    #24 23 12 37
+                    #print('%s %s %s %s' % (len(self.buf), x, self.fh_pos, self.file_size))
+                    section = self.buf[:x+1]
                     self.buf = self.buf[x+1:]
 
                     if self.enable_positional:
@@ -158,47 +208,172 @@ class parser:
                     self.fh_pos += x+1
 
                     if self.enable_text:
-                        self.root_state['__text__'] = section
-                    return json.dumps(self.root_state)
+                        self.root_state['__section_text__'] = section
+                    return self.root_state
 
                 x += 1
 
-            new_buf = self.fh.read(1024).decode('utf-8')
+
+            read_length = 1024
+            new_buf = None
+            for attempt in range(1,10):
+                try:
+                    new_buf = self.fh.read(read_length)
+                    break
+                except UnicodeError:
+                    read_length += 1
+                except UnicodeError:
+                    read_length += 1
+                except:
+                    raise
+
+
+            if new_buf == None:
+                new_buf = self.fh.read(read_length)
             self.buf += new_buf
 
 
-            if loops > 0 and len(self.buf.rstrip()) == 0:
+            if self.root_state != {} and loops > 0 and (len(self.buf.rstrip()) == 0 or 1+x >= len(self.buf)):
+                section = self.buf
+                self.buf = self.buf[x+1:]
+
+                if self.enable_positional:
+                    self.root_state['__position__'] = [self.fh_pos, len(section)]
+
+                self.fh_pos += x+1
+
+                if self.enable_text:
+                    self.root_state['__section_text__'] = section
+                return self.root_state
+            elif self.root_state == {} and loops > 0 and (len(self.buf.rstrip()) == 0 or 1+x+self.fh_pos >= len(self.buf)):
                 return
-            elif loops > 1000:
+            elif loops > 100000:
+                print('---------------------------------')
                 print(self.buf)
                 print(local_buf)
-                print('depth: %s, maxdepth: %s, loops: %s, buflen: %s' % (self.depth, self.max_depth, loops, len(self.buf)))
+                print(self.root_state)
+                print('depth: %s, maxdepth: %s, loops: %s, buflen: %s, x: %s, fh_pos: %s, file_size: %s' % (self.depth, self.max_depth, loops, len(self.buf), x, self.fh_pos, self.file_size))
+                print('----------------------------------')
 
                 raise Exception('Exceeded max loops, something is broken')
             else:
                 loops += 1
                 #print('depth: %s, maxdepth: %s, loops: %s, buflen: %s' % (self.depth, self.max_depth, loops, len(self.buf)))
 
-            if len(new_buf) == 0 and self.buf[-1:1] != '\n':
-                self.buf += '\n'
+            if len(new_buf) == 0:
+                if self.buf[-1:] != '\n':
+                    self.buf += '\n\n'
+
+            if len(new_buf) == 0 and self.depth > 0:
+                self.buf += '}\n\n'
+                if '__errors__' not in self.root_state:
+                    self.root_state['__errors__'] = []
+                self.root_state['__errors__'].append('Reached EOF with unbalanced {}, added closing } x1, position: %s' % (self.fh_pos, ))
 
 
+def check_path_pdxscript_txt(filename):
+    if filename[-4:].lower() != '.txt':
+        return False
+
+    dir_parts = filename.split('/')
+
+    if dir_parts[0] == 'common':
+        return True
+    if dir_parts[0] == 'events':
+        return True
+    if dir_parts[0] == 'flags':
+        return True
+    if dir_parts[0] == 'map':
+        return True
+    if dir_parts[0] == 'music':
+        return True
+    if dir_parts[0] == 'prescripted_countries':
+        return True
+
+    if dir_parts[0] == 'interface' and dir_parts[1] == 'resource_groups':
+        return True
+
+    if dir_parts[0] == 'gfx':
+        if dir_parts[1] == 'advisorwindow':
+            return True
+        if dir_parts[1] == 'pingmap':
+            return True
+        if dir_parts[1] == 'portraits':
+            if dir_parts[2] == 'asset_selectors':
+                return True
+            if dir_parts[2] == 'portraits':
+                return True
+        if dir_parts[1] == 'projectiles':
+            return True
+        if dir_parts[1] == 'shipview':
+            return True
+        if dir_parts[1] == 'worldgfx':
+            return True
+
+
+    
+
+    return False
+
+def parse_zip_file(zip_filename):
+    global zip_files, total_sections, total_files, total_parsed_files, last_file
+
+    with ZipFile(zip_filename) as modzip:
+        zip_files += 1
+        files = 0
+        parsed_files = 0
+
+        for info in modzip.infolist():
+            files += 1
+            if check_path_pdxscript_txt(info.filename):
+                last_file = info.filename
+                parsed_files += 1
+                with modzip.open(info) as modfile:
+                    with io.TextIOWrapper(modfile, encoding='utf-8-sig', errors='replace') as wrappedfile:
+                        p = parser(wrappedfile, info.file_size)
+
+                        section = ''
+
+                        x = 0
+                        try:
+                            while section := p.get_section():
+                                #print(section)
+                                x+=1
+                        except Exception as e:
+                            print('EXCEPTION! %s - %s - file: %s parsed: %s zip: %s' % (type(e), e, info.filename, x, zip_filename))
+                            raise
+                        finally:
+                            total_sections += x
+                            #print('\t\tparsed: %s, parsed_files: %s, total_sections: %s\tfile: %s' % (x, parsed_files, total_sections, info.filename))
+        total_files += files
+        total_parsed_files += parsed_files
+
+    print('zip_files: %s, total_files: %s, parsed_files: %s, total_sections: %s' % (zip_files, total_files, parsed_files, total_sections))
 
 
 if __name__ == '__main__':
-    with ZipFile('finished_mods/281990/8117eba5-3907-11ed-ae89-a502293073b2/281990_1121692237_814.zip') as modzip:
-        for info in modzip.infolist():
-            if('.txt' in info.filename and 'common' in info.filename):
-                with modzip.open(info) as modfile:
-                    p = parser(modfile)
+    #zip_filename = 'finished_mods/281990/8117eba5-3907-11ed-ae89-a502293073b2/281990_1121692237_814.zip'
 
-                    section = ''
+    zip_files = 0
+    last_file = ''
+    total_sections = 0
+    total_files = 0
+    total_parsed_files = 0
 
-                    x = 0
-                    try:
-                        while section := p.get_section():
-                            x+=1
-                    finally:
-                        print('file: %s parsed: %s' % (info.filename, x))
+    start_path = 'finished_mods/281990/'
+    dirs = os.listdir(start_path)
+    for uuid in dirs:
+        files = os.listdir('%s%s' % (start_path, uuid))
+        for this_file in files:
+            if this_file[-4:].lower() == '.zip':
+                try:
+                    zip_filename = '%s%s/%s' % (start_path, uuid, this_file)
+                    parse_zip_file(zip_filename)
+                except BadZipFile as e:
+                    print('BadZip: size: %s\t%s' % (os.path.getsize(zip_filename), zip_filename))
+                except:
+                    print('%s %s' % (zip_filename, last_file))
+                    raise
+
 
 
