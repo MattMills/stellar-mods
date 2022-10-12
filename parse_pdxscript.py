@@ -315,11 +315,9 @@ def check_path_pdxscript_txt(filename):
 
     return False
 
-def parse_zip_file(zip_filename):
-    global zip_files, total_sections, total_files, total_parsed_files, last_file
+def parse_zip_file(stats, zip_filename, enable_position = True, enable_text = True):
 
     with ZipFile(zip_filename) as modzip:
-        zip_files += 1
         files = 0
         parsed_files = 0
 
@@ -330,35 +328,41 @@ def parse_zip_file(zip_filename):
                 parsed_files += 1
                 with modzip.open(info) as modfile:
                     with io.TextIOWrapper(modfile, encoding='utf-8-sig', errors='replace') as wrappedfile:
-                        p = parser(wrappedfile, info.file_size)
+                        p = parser(wrappedfile, info.file_size, enable_position, enable_text)
 
                         section = ''
 
                         x = 0
                         try:
                             while section := p.get_section():
-                                #print(section)
                                 x+=1
+                                yield {'filename': info.filename, 'order': x, 'section': section }
                         except Exception as e:
                             print('EXCEPTION! %s - %s - file: %s parsed: %s zip: %s' % (type(e), e, info.filename, x, zip_filename))
                             raise
                         finally:
-                            total_sections += x
+                            stats['total_sections'] += x
                             #print('\t\tparsed: %s, parsed_files: %s, total_sections: %s\tfile: %s' % (x, parsed_files, total_sections, info.filename))
-        total_files += files
-        total_parsed_files += parsed_files
-
-    print('zip_files: %s, total_files: %s, parsed_files: %s, total_sections: %s' % (zip_files, total_files, parsed_files, total_sections))
+        stats['total_files'] += files
+        stats['total_parsed_files'] += parsed_files
 
 
 if __name__ == '__main__':
     #zip_filename = 'finished_mods/281990/8117eba5-3907-11ed-ae89-a502293073b2/281990_1121692237_814.zip'
 
-    zip_files = 0
+    stats = {}
+
+
+    stats['total_rows'] = 0;
+    stats['total_zip_files'] = 0;
+    stats['skipped_mods'] = 0;
+    stats['error_zip_files'] = 0;
+
+
+    stats['total_sections'] = 0;
+    stats['total_files'] = 0;
+    stats['total_parsed_files'] = 0
     last_file = ''
-    total_sections = 0
-    total_files = 0
-    total_parsed_files = 0
 
     start_path = 'finished_mods/281990/'
     dirs = os.listdir(start_path)
@@ -368,12 +372,13 @@ if __name__ == '__main__':
             if this_file[-4:].lower() == '.zip':
                 try:
                     zip_filename = '%s%s/%s' % (start_path, uuid, this_file)
-                    parse_zip_file(zip_filename)
+                    parse_zip_file(stats, zip_filename)
                 except BadZipFile as e:
                     print('BadZip: size: %s\t%s' % (os.path.getsize(zip_filename), zip_filename))
                 except:
                     print('%s %s' % (zip_filename, last_file))
                     raise
 
+    print(stats)
 
 
