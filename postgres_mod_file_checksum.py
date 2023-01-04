@@ -113,6 +113,8 @@ for mod_uuid in os.listdir(mods_finished):
     zip_files = []
 
     for filename in disk_files:
+        if filename in ('.section_v1_ingest_complete', '.localization_v1_ingest_complete'):
+            continue
         if filename not in database_files:
             missing_database_files[filename] = {
                     'filename': filename,
