@@ -33,6 +33,7 @@ done
 
 python3 ./postgres_preview_download.py
 python3 ./postgres_mod_download.py
-python3 ./postgres_mod_filelist_load.py
-python3 ./postgres_mod_stats_refresh.py
+#python3 ./postgres_mod_filelist_load.py
+python3 ./postgres_mod_file_checksum.py 
+python3 ./postgres_mod_stats_refresh.py 
 
