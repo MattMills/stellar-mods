@@ -26,9 +26,9 @@ class parser:
     # fh = file handle to open script file
     # enable_positional = Turn on/off source file position detail in output (prints x position from original file in state for each section, used for contextual highlighting)
 
-    def __init__(self, fh, file_size, enable_positional = True, enable_text = True):
+    def __init__(self, fh, enable_positional = True, enable_text = True):
         self.fh = fh
-        self.file_size = file_size
+        self.file_size = -1
         self.enable_positional = enable_positional
         self.enable_text = enable_text
 
@@ -172,7 +172,7 @@ class parser:
 
                         self.assignment = False
                         local_buf = ''
-                    if self.comment == True and c == '\n':
+                    if self.comment == True and (c == '\n' or ((len(self.buf.rstrip()) == 0 or 1+x+self.fh_pos >= len(self.buf)))):
                         if 'comments' not in self.this_state:
                             self.this_state['comments'] = []
                         if self.enable_positional:
@@ -315,36 +315,30 @@ def check_path_pdxscript_txt(filename):
 
     return False
 
-def parse_zip_file(stats, zip_filename, enable_position = True, enable_text = True):
+def parse_zip_file(stats, zip_filename, target_files, enable_position = True, enable_text = True):
 
     with ZipFile(zip_filename) as modzip:
-        files = 0
-        parsed_files = 0
+        for target_file in target_files:
+            if not check_path_pdxscript_txt(target_file):
+                stats['skipped_files'] += 1
+                continue
+            with modzip.open(target_file) as modfile:
+                with io.TextIOWrapper(modfile, encoding='utf-8-sig', errors='replace') as wrappedfile:
+                    p = parser(wrappedfile,  enable_position, enable_text)
 
-        for info in modzip.infolist():
-            files += 1
-            if check_path_pdxscript_txt(info.filename):
-                last_file = info.filename
-                parsed_files += 1
-                with modzip.open(info) as modfile:
-                    with io.TextIOWrapper(modfile, encoding='utf-8-sig', errors='replace') as wrappedfile:
-                        p = parser(wrappedfile, info.file_size, enable_position, enable_text)
+                    section = ''
 
-                        section = ''
-
-                        x = 0
-                        try:
-                            while section := p.get_section():
-                                x+=1
-                                yield {'filename': info.filename, 'order': x, 'section': section }
-                        except Exception as e:
-                            print('EXCEPTION! %s - %s - file: %s parsed: %s zip: %s' % (type(e), e, info.filename, x, zip_filename))
-                            raise
-                        finally:
-                            stats['total_sections'] += x
-                            #print('\t\tparsed: %s, parsed_files: %s, total_sections: %s\tfile: %s' % (x, parsed_files, total_sections, info.filename))
-        stats['total_files'] += files
-        stats['total_parsed_files'] += parsed_files
+                    x = 0
+                    try:
+                        while section := p.get_section():
+                            print('%s %s %s' % (target_file, x, section))
+                            x+=1
+                            yield {'filename': target_file, 'order': x, 'section': section }
+                    except Exception as e:
+                        print('EXCEPTION! %s - %s - file: %s parsed: %s zip: %s' % (type(e), e, target_file, x, zip_filename))
+                        raise
+                    finally:
+                        stats['total_sections'] += x
 
 
 if __name__ == '__main__':

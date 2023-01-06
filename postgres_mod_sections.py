@@ -63,6 +63,7 @@ stats = {}
 stats['total_rows'] = 0;
 stats['total_zip_files'] = 0;
 stats['skipped_mods'] = 0;
+stats['skipped_files'] = 0;
 stats['error_zip_files'] = 0;
 
 
@@ -74,36 +75,80 @@ last_file = '' #used for debug
 
 
 # Fetch list of mods and file uuids from the database
+#cur.execute(
+#    'select mods.uuid as mod_uuid, mods_filelist.uuid as file_uuid, filename from mods '
+#    '  left join mods_filelist on (mods.uuid = mods_filelist.mod_uuid)'
+#    " where "#our_time_created >= now() - INTERVAL '15 day'"
+#    #"  and 
+#    "lower(mods_filelist.filename) like '%.txt'"
+#    )
 cur.execute(
-    'select mods.uuid as mod_uuid, mods_filelist.uuid as file_uuid, filename from mods '
-    '  left join mods_filelist on (mods.uuid = mods_filelist.mod_uuid)'
-    " where "#our_time_created >= now() - INTERVAL '15 day'"
-    #"  and 
-    "lower(mods_filelist.filename) like '%.txt'"
-    )
-mod_files = {}
+        'WITH limit_mmf AS( '
+'    SELECT '
+'        * '
+'        ,row_number() OVER (PARTITION BY mod_file_id) as row_num '
+'    FROM mod_mod_files '
+' ) '
+'select limit_mmf.mod_uuid, mf.id as mod_file_id, mod_file_paths.path, mod_file_names.filename '
+'from mod_files mf '
+'left join limit_mmf on (limit_mmf.mod_file_id = mf.id and limit_mmf.row_num = 1) '
+'left join mod_file_paths on (limit_mmf.mod_file_path_id = mod_file_paths.id) '
+'left join mod_file_names on (limit_mmf.mod_file_name_id = mod_file_names.id) '
+'where '
+"    mod_file_names.filename like '%.txt' "
+"      and  mod_file_names.filename not like 'manifest_%.txt' "
+'  and ( '
+"    mod_file_paths.path like 'common%' "
+"    or mod_file_paths.path like 'events%' "
+"    or mod_file_paths.path like 'flags%' "
+"    or mod_file_paths.path like 'map%' "
+"    or mod_file_paths.path like 'music%' "
+"    or mod_file_paths.path like 'prescripted_countries%' "
+"    or mod_file_paths.path like 'interface/resource_groups%' "
+"    or mod_file_paths.path like 'gfx/advisorwindow%' "
+"    or mod_file_paths.path like 'gfx/pingmap%' "
+"    or mod_file_paths.path like 'gfx/portraits/asset_selectors%' "
+"    or mod_file_paths.path like 'gfx/portraits/portraits%' "
+"    or mod_file_paths.path like 'gfx/projectiles%' "
+"    or mod_file_paths.path like 'gfx/shipview%' "
+"    or mod_file_paths.path like 'gfx/worldgfx%' "
+'  ) '
+'      and mf.id not in (select distinct mod_file_id from sections) '
+'      and mf.size > 0 '
+'order by mod_uuid asc, path asc, filename asc '
+)
 
-for row in cur.fetchall():
-    stats['total_rows'] += 1
-    if row['mod_uuid'] not in mod_files:
-        mod_files[row['mod_uuid']] = {}
-    mod_files[row['mod_uuid']][row['filename']] = row['file_uuid']
-
-
-
-stats['db_mod_count'] = len(mod_files)
+insert_todo = []
 
 mods_finished = 'finished_mods/281990/'
-for mod_uuid in mod_files.keys():
-    error = False
-    if os.path.exists('%s/%s/.section_v1_ingest_complete' % (mods_finished, mod_uuid)):
-        stats['skipped_mods'] += 1
+last_mod_uuid = ''
+target_file_aggr = []
+filename_to_id = {}
+
+for row in cur.fetchall():
+    mod_uuid = row['mod_uuid']
+    mod_file_id = row['mod_file_id']
+    file_path = row['path']
+    file_name = row['filename']
+    target_file = '%s/%s' % (file_path, file_name)
+
+
+    stats['total_rows'] += 1
+
+    if last_mod_uuid == '':
+        last_mod_uuid = mod_uuid
+
+
+    if last_mod_uuid == mod_uuid:
+        target_file_aggr.append(target_file)
+        filename_to_id[target_file] = mod_file_id
         continue
 
+
     try:
-        dirs = os.listdir('%s%s' % (mods_finished, mod_uuid))
+        dirs = os.listdir('%s%s' % (mods_finished, last_mod_uuid))
     except Exception as e:
-        log.warning('Unable to list dirs for %s, (%s) %s' % (mod_uuid, type(e), e))
+        log.warning('Unable to list dirs for %s, (%s) %s' % (last_mod_uuid, type(e), e))
         continue
 
     for f in dirs:
@@ -111,32 +156,45 @@ for mod_uuid in mod_files.keys():
             continue
 
         stats['total_zip_files'] += 1
-        zip_filename = '%s%s/%s' % (mods_finished, mod_uuid, f)
+        zip_filename = '%s%s/%s' % (mods_finished, last_mod_uuid, f)
         
-        log.info('Accessing zip file (%s) for mod (%s)' % (f, mod_uuid))
+        log.info('Accessing zip file (%s) for mod (%s)' % (f, last_mod_uuid))
 
         try: 
-            for section in parse_zip_file(stats, zip_filename, True, False):
-                if section['filename'] not in mod_files[mod_uuid]:
-                    error = True
-                    continue
-                section['file_uuid'] = mod_files[mod_uuid][section['filename']]
-                cur.execute(cur.mogrify('insert into sections_v1 (file_uuid, section_order, section) values (%(file_uuid)s, %(order)s, %(section)s) on conflict do nothing', section))
-
+            for section in parse_zip_file(stats, zip_filename, target_file_aggr, True, False):
+                insert_todo.append((section['order'], section['section'], filename_to_id[section['filename']]))
         except BadZipFile as e:
-            log.warning('Encountered bad/broken zip file (%s) for mod (%s): [%s]: %s' % (f, mod_uuid, type(e),e))
+            log.warning('Encountered bad/broken zip file (%s) for mod (%s): [%s]: %s' % (f, last_mod_uuid, type(e),e))
         except Exception as e:
-            log.warning('Unknown Exception parsing zipfile (%s) for mod (%s): [%s]: %s' % (f, mod_uuid, type(e), e))
+            log.warning('Unknown Exception parsing zipfile (%s) for mod (%s): [%s]: %s' % (f, last_mod_uuid, type(e), e))
             #raise
-        finally:
-            log.info(stats)
-            dbh.commit()
-    if error == False:
-        with open('%s/%s/.section_v1_ingest_complete' % (mods_finished, mod_uuid), 'w') as fh:
-            fh.write(json.dumps({'stats': stats}))
+
+    last_mod_uuid = mod_uuid
+    target_file_aggr = []
+    target_file_aggr.append(target_file)
+
+    filename_to_id = {}
+    filename_to_id[target_file] = mod_file_id
 
 
+    if len(insert_todo) >= 1000:
+        sql = 'insert into sections (section_order, section, mod_file_id) values '
+        sql += ','.join(cur2.mogrify('(%s, %s, %s)', i ).decode('utf-8') for i in insert_todo)
+        sql += " on conflict do nothing"
+        sql = sql.replace("\u0000", "\\\\u0000").replace("\\u0000", "\\\\u0000")
+
+        cur.execute(sql)
+        dbh.commit()
+        insert_todo = []
    
+
+if len(insert_todo) > 0:
+    sql = 'insert into sections (section_order, section, mod_file_id) values '
+    sql += ','.join(cur2.mogrify('(%s, %s, %s)', i ).decode('utf-8') for i in insert_todo)
+    sql += " on conflict do nothing"
+    sql = sql.replace("\u0000", "\\\\u0000").replace("\\u0000", "\\\\u0000")
+    cur.execute(sql)
+    dbh.commit()
 
 log.info('Final stats: %s' % (stats))
 
