@@ -54,7 +54,7 @@ logging.getLogger("elastic_transport.transport").setLevel(logging.WARNING)
 log.info('ElasticSearch mod metadata ingest start')
 
 
-es = Elasticsearch("https://10.5.10.6:9200", verify_certs=False, http_auth=('ingest_es', 'z9E22#m*M557AJk7dRxU'))
+es = Elasticsearch("https://127.0.0.1:9200", verify_certs=False, http_auth=('ingest_es', 'z9E22#m*M557AJk7dRxU'))
 from elasticsearch.helpers import bulk
 
 index_dir = 'archive_steam_workshop_data'
@@ -71,8 +71,8 @@ for appid in dirs:
                     actions = []
                     for zipped_file in current_zip.namelist():
                         log.info('Ingest start %s %s' % (zipfile, zipped_file,))
-                        json_full_doc = json.loads(current_zip.read(zipped_file))
                         try:
+                            json_full_doc = json.loads(current_zip.read(zipped_file))
                             index_datestamp = datetime.fromisoformat(zipfile[:-4]).strftime('%Y-%m-%d')
                             try:
                                 result = es.search(index='mod-metadata-complete-index-v1', query={ 'match_phrase': {'name': zipped_file} })
