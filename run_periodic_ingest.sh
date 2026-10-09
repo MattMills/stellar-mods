@@ -4,18 +4,17 @@ DATA_FOLDER='steam_workshop_data/'
 ARCHIVE_SUFFIX='archive_'
 cd /zpool0/share/stellar-mods/
 
-
-
-if { set -C; 2>/dev/null > run_periodic_ingest.lock; }; then
-	trap "rm -f run_periodic_ingest.lock" EXIT
-else
-	echo "Lock file exists... script already running?"
-	exit
-fi
-
 . /opt/esp/esp-idf/export.sh
 echo "Fetching data from Steam workshop"
 python3 steam_workshop.py
+
+# flock: the kernel drops the lock when the holder exits or dies, so a
+# crash or reboot can no longer leave a stale lock behind.
+exec 9>run_periodic_ingest.lock
+if ! flock -n 9; then
+	echo "Lock held by another run... script already running?"
+	exit
+fi
 
 find $DATA_FOLDER -iname '*-*-*T*:*:*.*' -printf "%T@ %p\0" -type d  | sort -zn | while read -d $'\0' folder 
 do
@@ -35,5 +34,5 @@ python3 ./postgres_preview_download.py
 python3 ./postgres_mod_download.py
 #python3 ./postgres_mod_filelist_load.py
 python3 ./postgres_mod_file_checksum.py 
-python3 ./postgres_mod_stats_refresh.py 
+#python3 ./postgres_mod_stats_refresh.py 
 

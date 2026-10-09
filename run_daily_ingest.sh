@@ -4,10 +4,11 @@ cd /zpool0/share/stellar-mods/
 
 
 
-if { set -C; 2>/dev/null > run_daily_ingest.lock; }; then
-	trap "rm -f run_daily_ingest.lock" EXIT
-else
-	echo "Lock file exists... script already running?"
+# flock: the kernel drops the lock when the holder exits or dies, so a
+# crash or reboot can no longer leave a stale lock behind.
+exec 9>run_daily_ingest.lock
+if ! flock -n 9; then
+	echo "Lock held by another run... script already running?"
 	exit
 fi
 

@@ -6,3 +6,4 @@ finished_mods/
 finished_previews/
 logs/
 SECRET_STEAM_API_KEY
+*.lock
