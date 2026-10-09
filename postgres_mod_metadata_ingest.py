@@ -117,7 +117,13 @@ for filename in os.listdir(parse_dir):
         stats['file_count'] += 1
         logging.info('(%s) %s - Parse start' % (stats['file_count'], full_filename))
         with open(full_filename, 'r') as fh:
-            data = json.load(fh)
+            try:
+                data = json.load(fh)
+            except ValueError as e:
+                # Partial fetches end in an error page saved as .json; skip it
+                # like the empty last page below rather than dying mid-snapshot.
+                logging.error('(%s) %s - NOT JSON, skipped (%s)' % (stats['file_count'], full_filename, e))
+                continue
             sql_statement_mods = (
                     'insert into mods ('
                         'publishedfileid, creator_appid, consumer_appid, consumer_shortcutid,'
@@ -144,7 +150,7 @@ for filename in os.listdir(parse_dir):
                     ') values '
                     ).encode('utf-8')
 
-            if 'publishedfiledetails' not in data['response']:
+            if 'publishedfiledetails' not in data.get('response', {}):
                 continue # Last file is empty, we don't list dir in order
 
             for file_details in data['response']['publishedfiledetails']:
@@ -159,7 +165,7 @@ for filename in os.listdir(parse_dir):
                 stats['file_mod_count'] += 1
                 if file_details['publishedfileid'] in existing_mod_detail: #mod already exists in DB
                     stats['existing_mod_count'] += 1
-                    if file_details['revision_change_number'] in existing_mod_detail[file_details['publishedfileid']]:
+                    if file_details.get('revision_change_number') in existing_mod_detail[file_details['publishedfileid']]:
                         #Update DB
                         stats['existing_mod_update_count'] += 1
                     else:
@@ -206,19 +212,22 @@ for filename in os.listdir(parse_dir):
                     'ban_text_check_result = EXCLUDED.ban_text_check_result,'
                     'title = EXCLUDED.title'
                 )
+            # The upsert returns every row it inserted or updated, which is all the
+            # dict needs. Re-reading the whole mods table after every page instead
+            # (~0.5 s x ~290 pages per snapshot) was ~90% of the ingest time.
+            sql_statement_mods += b' RETURNING uuid, publishedfileid, revision_change_number'
             cur.execute(sql_statement_mods)
+            for mod_detail in cur.fetchall():
+                existing_mod_detail.setdefault(mod_detail['publishedfileid'], {})[mod_detail['revision_change_number']] = mod_detail['uuid']
             dbh.commit()
-
-            # if we've inserted any new uuids we need to get them before we can do stats and files on this input file, not super efficient but plenty fast for now.
-            existing_mod_detail = refresh_existing_mod_detail()
 
 
             for file_details in data['response']['publishedfiledetails']:
                 if file_details['publishedfileid'] not in existing_mod_detail:
                     log.warning('Ignoring non-existing mod %s' % (file_details['publishedfileid'],))
                     continue #ignore anything not in DB by this point, as it's likely one of the failed mods above.
-                if file_details['revision_change_number'] not in existing_mod_detail[file_details['publishedfileid']]:
-                    log.warning('Ignoring non-existant mod revision %s %s' % (file_details['publishedfileid'], file_details['revision_change_number']))
+                if file_details.get('revision_change_number') not in existing_mod_detail[file_details['publishedfileid']]:
+                    log.warning('Ignoring non-existant mod revision %s %s' % (file_details['publishedfileid'], file_details.get('revision_change_number')))
                     continue #If the mod exists but the revision doesn't, something goofy is going on
                 
                 file_details['parse_date'] = parse_date
