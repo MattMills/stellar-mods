@@ -7,3 +7,4 @@ finished_previews/
 logs/
 SECRET_STEAM_API_KEY
 *.lock
+ingest_halted
