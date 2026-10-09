@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Render the Steam workshop ingest status page.
 
-Run every few minutes by ingest-status.timer. Writes index.html and
-status.json to OUT_DIR. Folder and zip sizes are cached in STATE_DIR, so
-only the first run walks the whole backlog; later runs stat what is new.
+Runs as ingest-status.service and rewrites index.html and status.json in
+OUT_DIR every REFRESH seconds; the page swaps itself in place every few
+seconds. Postgres and zfs are queried every SLOW_EVERY seconds. Folder and
+zip sizes are kept in memory and saved to STATE_DIR, so only a cold start
+walks the whole backlog. `--once` renders a single page and exits.
 Read-only towards the ingest: it never touches the lock (holders are read
 from /proc/locks) and never writes under BASE.
 """
@@ -13,8 +15,11 @@ import html
 import json
 import os
 import re
+import signal
 import subprocess
+import sys
 import time
+import traceback
 import zipfile
 
 BASE = '/zpool0/share/stellar-mods'
@@ -33,8 +38,12 @@ DB = 'stellar-mods'
 OUT_DIR = '/var/www/html/ingest-status'
 STATE_DIR = '/var/lib/ingest-status'
 SETTLE = 120          # seconds unchanged before a folder or zip size is cached
-RATE_WINDOW = 6 * 3600
+RATE_WINDOW = 3600     # throughput and ETA average over this; the loop does ~150 snapshots an hour
 HISTORY_KEEP = 8 * 86400
+REFRESH = 5           # seconds between page rewrites
+SLOW_EVERY = 60       # seconds between Postgres and zfs queries
+SAVE_EVERY = 300      # seconds between cache saves and history samples
+STALE_AFTER = 30      # the page warns when its data is older than this
 
 STAGES = [
     ('steam_workshop.py', 'Steam fetch', None),
@@ -248,7 +257,8 @@ def zfs_usage():
 
 def postgres():
     try:
-        r = subprocess.run(['runuser', '-u', 'postgres', '--', 'psql', '-d', DB, '-XAtq', '-c', SQL],
+        # Same local-socket login the ingest scripts use; runuser would log a PAM session every query.
+        r = subprocess.run(['psql', '-U', 'postgres', '-d', DB, '-XAtq', '-c', SQL],
                            capture_output=True, text=True, timeout=120, cwd='/tmp')
     except (OSError, subprocess.SubprocessError) as e:
         return {'error': str(e)}
@@ -373,10 +383,11 @@ def fmt_age(s):
     return f'{d} d {h} h'
 
 
-def fmt_time(t, with_date=True):
+def fmt_time(t, with_date=True, seconds=False):
     if t is None:
         return '–'
-    return time.strftime('%b %-d %Y, %H:%M %Z' if with_date else '%H:%M %Z', time.localtime(t))
+    clock = '%H:%M:%S' if seconds else '%H:%M'
+    return time.strftime(f'%b %-d %Y, {clock} %Z' if with_date else f'{clock} %Z', time.localtime(t))
 
 
 def fmt_pgtime(s):
@@ -466,20 +477,23 @@ tr:last-child td{border-bottom:0}
 details{margin-top:10px} summary{cursor:pointer;color:var(--ink2);font-size:13px}
 .err{color:var(--critical);white-space:pre-wrap}
 footer{margin-top:28px;color:var(--muted);font-size:12.5px}
+.stale{display:flex;align-items:center;gap:6px;font-weight:600;margin:-6px 0 14px}
+.stale[hidden]{display:none}
+.stale svg{width:16px;height:16px;flex:none}
 @media (max-width:520px){.hero .big{font-size:40px}.state{text-align:left}}
 """
 
 JS = r"""
 (function(){
-const S = JSON.parse(document.getElementById('series').textContent);
-const box = document.getElementById('chart'), tip = document.getElementById('tip');
-if (S.length < 2) { box.innerHTML = '<p class="muted">Collecting data: the chart starts once a few snapshots have been processed.</p>'; box.style.height='auto'; return; }
+const REFRESH_MS = REFRESH_S * 1000;
+let S = [], box, tip, hover = null, failing = null, ready = false;
 const fmtN = v => Math.round(v).toLocaleString();
 const fmtT = (t, d) => new Date(t*1000).toLocaleString([], d ? {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'} : {hour:'2-digit', minute:'2-digit'});
 function niceStep(range, n){ const raw = range / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
   for (const m of [1, 2, 2.5, 5, 10]) if (m*mag >= raw) return m*mag; return 10*mag; }
 const TSTEPS = [300,900,1800,3600,7200,10800,21600,43200,86400,172800,604800];
 function draw(){
+  if (S.length < 2) { box.innerHTML = '<p class="muted">Collecting data: the chart starts once a few snapshots have been processed.</p>'; box.style.height = 'auto'; return; }
   const W = box.clientWidth, H = 240, L = 58, R = 70, T = 12, B = 28, pw = W-L-R, ph = H-T-B;
   if (pw < 60) return;  // not laid out yet (hidden tab); the ResizeObserver redraws
   const t0 = S[0][0], t1 = S[S.length-1][0];
@@ -509,9 +523,9 @@ function draw(){
        `<circle id="xd" r="4.5" fill="var(--series)" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>` +
        `<rect x="${L}" y="${T}" width="${pw}" height="${ph}" fill="transparent" id="hit"/>`;
   box.innerHTML = `<svg width="${W}" height="${H}" role="img" aria-label="Snapshots remaining over time">${g}</svg>`;
-  const svg = box.firstChild, xh = svg.querySelector('#xh'), xd = svg.querySelector('#xd');
-  svg.querySelector('#hit').addEventListener('pointermove', ev => {
-    const r = svg.getBoundingClientRect(), mx = ev.clientX - r.left;
+  const svg = box.firstChild, xh = svg.querySelector('#xh'), xd = svg.querySelector('#xd'), hit = svg.querySelector('#hit');
+  function show(clientX){
+    const r = svg.getBoundingClientRect(), mx = clientX - r.left;
     const t = t0 + (mx - L) / pw * (t1 - t0);
     let lo = 0, hi = S.length - 1;
     while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (S[mid][0] < t) lo = mid; else hi = mid; }
@@ -524,14 +538,59 @@ function draw(){
     const tw = tip.offsetWidth;
     tip.style.left = Math.min(Math.max(px - tw / 2, 0), W - tw) + 'px';
     tip.style.top = Math.max(py - 58, 0) + 'px';
+  }
+  hit.addEventListener('pointermove', ev => { hover = ev.clientX; show(hover); });
+  hit.addEventListener('pointerleave', () => {
+    hover = null; tip.style.display = 'none'; xh.setAttribute('visibility', 'hidden'); xd.setAttribute('visibility', 'hidden');
   });
-  svg.querySelector('#hit').addEventListener('pointerleave', () => {
-    tip.style.display = 'none'; xh.setAttribute('visibility', 'hidden'); xd.setAttribute('visibility', 'hidden');
-  });
+  if (hover !== null) show(hover);  // keep the tooltip up across live refreshes
 }
+
+// The chart follows whichever <main> is current: mount() runs on load and after each swap.
 let rt, lastW = -1;
-new ResizeObserver(() => { if (box.clientWidth === lastW) return; lastW = box.clientWidth;
-  clearTimeout(rt); rt = setTimeout(draw, 50); }).observe(box);
+const ro = new ResizeObserver(() => { if (box.clientWidth === lastW) return; lastW = box.clientWidth;
+  clearTimeout(rt); rt = setTimeout(draw, 50); });
+function mount(){
+  S = JSON.parse(document.getElementById('series').textContent);
+  box = document.getElementById('chart'); tip = document.getElementById('tip');
+  ro.disconnect(); draw(); lastW = box.clientWidth; ro.observe(box);
+}
+
+// Live refresh: fetch the page and swap <main> in place (no reload, no flicker).
+async function refresh(){
+  if (document.hidden) return;
+  try {
+    const r = await fetch(location.pathname, {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const next = new DOMParser().parseFromString(await r.text(), 'text/html').querySelector('main');
+    if (!next) throw new Error('empty page');
+    const open = [...document.querySelectorAll('main details')].map(d => d.open);
+    document.querySelector('main').replaceWith(next);
+    document.querySelectorAll('main details').forEach((d, i) => { if (open[i]) d.open = true; });
+    failing = null;
+    mount();
+  } catch (e) { failing = e.message || String(e); }
+  ready = true;
+  tick();
+}
+
+// Every second: how old the data is, and a warning once it is stale. Waits for
+// the first fetch: a navigation can be served a cached copy of the page.
+function tick(){
+  if (!ready) return;
+  const age = Date.now() / 1000 - Number(document.querySelector('main').dataset.generated);
+  document.getElementById('age').textContent = age < 2 ? 'just now' : age < 90 ? Math.round(age) + ' s ago' : Math.round(age / 60) + ' min ago';
+  const warn = document.getElementById('stale');
+  warn.hidden = !failing && age <= STALE_S;
+  if (!warn.hidden) warn.querySelector('span').textContent = failing
+    ? `Can't reach the status page (${failing}); showing data from ${Math.round(age)} s ago.`
+    : `No new data for ${Math.round(age)} s: is ingest-status.service running on hippo?`;
+}
+
+mount(); refresh();
+setInterval(refresh, REFRESH_MS);
+setInterval(tick, 1000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 })();
 """
 
@@ -616,11 +675,12 @@ def render(m):
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="120">
+<noscript><meta http-equiv="refresh" content="{REFRESH * 2}"></noscript>
 <title>Steam ingest status</title><style>{CSS}</style></head>
-<body><main>
+<body><main data-generated="{m['now']:.3f}">
 <header><h1>Steam workshop ingest <span class="muted" style="font-weight:400">· stellar-mods {APPID}</span></h1>
-<div class="muted">Updated {fmt_time(m['now'])} · refreshes every 5 min</div></header>
+<div class="muted">Updated {fmt_time(m['now'], seconds=True)} (<span id="age">just now</span>) · live, every {REFRESH} s</div></header>
+<div class="stale" id="stale" role="alert" hidden>{ICONS['critical']}<span></span></div>
 
 <section class="card hero">
   <div class="top">
@@ -654,101 +714,151 @@ def render(m):
     <div class="muted" style="margin-top:8px;font-size:12.5px">Ingest lock: {'held' if m['holder'] else 'free'}</div></div>
 </div>
 
-<h2>Postgres <span class="muted" style="font-weight:400">· {DB}</span></h2>
+<h2>Postgres <span class="muted" style="font-weight:400">· {DB} · queried every {SLOW_EVERY} s, last {fmt_age(m['now'] - m['pg_t'])} ago</span></h2>
 {pg_html}
 
 <footer>Sizes are decimal (1 GB = 10⁹ bytes). Backlog sizes are uncompressed file sizes; processed = catch-up archives under
-archive_steam_workshop_data. Generated by {esc(BASE)}/status/ingest_status.py in {m['elapsed']:.1f} s. Raw data: <a href="status.json" style="color:inherit">status.json</a>.</footer>
-</main>
+archive_steam_workshop_data. Generated by ingest-status.service ({esc(BASE)}/status/ingest_status.py) in {m['elapsed'] * 1000:.0f} ms. Raw data: <a href="status.json" style="color:inherit">status.json</a>.</footer>
 <script type="application/json" id="series">{json.dumps(m['series'])}</script>
-<script>{JS}</script>
+</main>
+<script>{JS.replace('REFRESH_S', str(REFRESH)).replace('STALE_S', str(STALE_AFTER))}</script>
 </body></html>
 """
 
 
 # ---------------------------------------------------------------- main
 
-def main():
-    t_start = time.time()
-    now = t_start
-    os.makedirs(STATE_DIR, exist_ok=True)
-    os.makedirs(OUT_DIR, exist_ok=True)
-    cache = load_json(f'{STATE_DIR}/cache.json', {})
+class Collector:
+    """Everything that survives between passes: size caches, the slow
+    Postgres/zfs readings, and the history used for rates."""
 
-    folders, keep_f = scan_queue(cache.get('folders', {}), now)
-    zips, keep_z = scan_archive(cache.get('zips', {}), now)
-    write_atomic(f'{STATE_DIR}/cache.json', json.dumps({'folders': keep_f, 'zips': keep_z}))
+    def __init__(self, now):
+        cache = load_json(f'{STATE_DIR}/cache.json', {})
+        self.folder_cache = cache.get('folders', {})
+        self.zip_cache = cache.get('zips', {})
+        self.history = load_history(now)
+        self.pg, self.zfs, self.pg_t = {}, [], 0
+        self.tps = self.db_growth = None
+        self.prev_commits = None   # (t, xact_commit) from the previous slow pass
+        self.saved_t = 0
+        self.sample = None
 
-    proc_times = sorted(z['ctime'] for z in zips.values())
-    arrivals = [t for t in (snap_ts(n) for n in list(folders) + list(zips)) if t]
-    remaining = len(folders)
-
-    window_start = max(now - RATE_WINDOW, proc_times[0] if proc_times else now - RATE_WINDOW)
-    window = max(now - window_start, 1)
-    done_w = len(proc_times) - bisect.bisect_right(proc_times, window_start)
-    arrived_w = sum(1 for t in arrivals if t > window_start)
-    p_h, a_h = done_w / window * 3600, arrived_w / window * 3600
-    net = p_h - a_h
-    rate = {'window_s': window, 'processed_per_h': p_h, 'arrived_per_h': a_h, 'net_per_h': net,
-            'eta_s': remaining / net * 3600 if net > 0 and remaining > 1 else (0 if remaining <= 1 else None)}
-
-    holder = lock_held(LOCK_FILE)
-    try:
-        with open(HALT_FILE) as f:
-            halted = f.read().strip() or 'an unnamed snapshot'
-    except OSError:
-        halted = None
-    level, label, detail = health(now, remaining, holder, proc_times[-1] if proc_times else None, halted)
-
-    fetchers = []
-    for flabel, newest in (('stellar-mods', max(folders) if folders else newest_snapshot(f'{BASE}/steam_workshop_data')),
-                           ('terra-mods', newest_snapshot(TERRA_QUEUE))):
-        flevel, fage, _ = fetch_health(now, newest)
-        fetchers.append({'label': flabel, 'level': flevel, 'age': fage, 'newest': newest})
-
-    pg = postgres()
-    history = load_history(now)
-    tps = db_growth = None
-    if 'error' not in pg:
-        commits = (pg.get('db') or {}).get('xact_commit')
-        if history and commits is not None and history[-1].get('commits') is not None:
-            d = commits - history[-1]['commits']
-            if d >= 0 and now > history[-1]['t']:
-                tps = d / (now - history[-1]['t'])
-        day = [r for r in history if r.get('db_size') and now - r['t'] >= 3600]
-        if day and pg.get('db_size'):
+    def slow(self, now):
+        self.pg, self.zfs, self.pg_t = postgres(), zfs_usage(), now
+        if 'error' in self.pg:
+            return
+        commits = (self.pg.get('db') or {}).get('xact_commit')
+        if self.prev_commits and commits is not None:
+            t, c = self.prev_commits
+            self.tps = (commits - c) / (now - t) if commits >= c and now > t else None
+        self.prev_commits = (now, commits) if commits is not None else None
+        day = [r for r in self.history if r.get('db_size') and now - r['t'] >= 3600]
+        if day and self.pg.get('db_size'):
             ref = min(day, key=lambda r: abs((now - r['t']) - 86400))
-            db_growth = (pg['db_size'] - ref['db_size']) / (now - ref['t']) * 86400
-    sample = {'t': round(now), 'remaining': remaining, 'processed': len(zips),
-              'remaining_bytes': sum(f['apparent'] for f in folders.values()),
-              'processed_bytes': sum(z['uncompressed'] for z in zips.values()),
-              'db_size': pg.get('db_size'), 'commits': (pg.get('db') or {}).get('xact_commit')}
-    history.append(sample)
-    write_atomic(f'{STATE_DIR}/history.jsonl', ''.join(json.dumps(r) + '\n' for r in history))
+            self.db_growth = (self.pg['db_size'] - ref['db_size']) / (now - ref['t']) * 86400
 
-    m = {
-        'now': now,
-        'queue': {'count': remaining, 'apparent': sample['remaining_bytes'],
-                  'disk': sum(f['disk'] for f in folders.values()),
-                  'files': sum(f['files'] for f in folders.values())},
-        'archive': {'count': len(zips), 'uncompressed': sample['processed_bytes'],
-                    'size': sum(z['size'] for z in zips.values())},
-        'rate': rate,
-        'health': {'level': level, 'label': label, 'detail': detail},
-        'holder': holder,
-        'data_reached': min(folders) if folders else None,
-        'processes': ingest_processes(),
-        'stages': stage_last_runs(),
-        'fetchers': fetchers,
-        'zfs': zfs_usage(),
-        'pg': pg,
-        'tps': tps,
-        'db_growth': db_growth,
-        'series': remaining_series(now, remaining, proc_times, arrivals),
-    }
-    m['elapsed'] = time.time() - t_start
+    def save(self, now):
+        """Persist the size caches and add a history sample."""
+        write_atomic(f'{STATE_DIR}/cache.json', json.dumps({'folders': self.folder_cache, 'zips': self.zip_cache}))
+        if self.sample:
+            self.history = [r for r in self.history if now - r['t'] <= HISTORY_KEEP] + [self.sample]
+            write_atomic(f'{STATE_DIR}/history.jsonl', ''.join(json.dumps(r) + '\n' for r in self.history))
+        self.saved_t = now
+
+    def collect(self, now):
+        folders, self.folder_cache = scan_queue(self.folder_cache, now)
+        zips, self.zip_cache = scan_archive(self.zip_cache, now)
+        if now - self.pg_t >= SLOW_EVERY:
+            self.slow(now)
+
+        proc_times = sorted(z['ctime'] for z in zips.values())
+        arrivals = [t for t in (snap_ts(n) for n in list(folders) + list(zips)) if t]
+        remaining = len(folders)
+
+        window_start = max(now - RATE_WINDOW, proc_times[0] if proc_times else now - RATE_WINDOW)
+        window = max(now - window_start, 1)
+        done_w = len(proc_times) - bisect.bisect_right(proc_times, window_start)
+        arrived_w = sum(1 for t in arrivals if t > window_start)
+        p_h, a_h = done_w / window * 3600, arrived_w / window * 3600
+        net = p_h - a_h
+        rate = {'window_s': window, 'processed_per_h': p_h, 'arrived_per_h': a_h, 'net_per_h': net,
+                'eta_s': remaining / net * 3600 if net > 0 and remaining > 1 else (0 if remaining <= 1 else None)}
+
+        holder = lock_held(LOCK_FILE)
+        try:
+            with open(HALT_FILE) as f:
+                halted = f.read().strip() or 'an unnamed snapshot'
+        except OSError:
+            halted = None
+        level, label, detail = health(now, remaining, holder, proc_times[-1] if proc_times else None, halted)
+
+        fetchers = []
+        for flabel, newest in (('stellar-mods', max(folders) if folders else newest_snapshot(f'{BASE}/steam_workshop_data')),
+                               ('terra-mods', newest_snapshot(TERRA_QUEUE))):
+            flevel, fage, _ = fetch_health(now, newest)
+            fetchers.append({'label': flabel, 'level': flevel, 'age': fage, 'newest': newest})
+
+        remaining_bytes = sum(f['apparent'] for f in folders.values())
+        processed_bytes = sum(z['uncompressed'] for z in zips.values())
+        self.sample = {'t': round(now), 'remaining': remaining, 'processed': len(zips),
+                       'remaining_bytes': remaining_bytes, 'processed_bytes': processed_bytes,
+                       'db_size': self.pg.get('db_size'), 'commits': (self.pg.get('db') or {}).get('xact_commit')}
+        if now - self.saved_t >= SAVE_EVERY:
+            self.save(now)
+
+        return {
+            'now': now,
+            'queue': {'count': remaining, 'apparent': remaining_bytes,
+                      'disk': sum(f['disk'] for f in folders.values()),
+                      'files': sum(f['files'] for f in folders.values())},
+            'archive': {'count': len(zips), 'uncompressed': processed_bytes,
+                        'size': sum(z['size'] for z in zips.values())},
+            'rate': rate,
+            'health': {'level': level, 'label': label, 'detail': detail},
+            'holder': holder,
+            'halted': halted,
+            'data_reached': min(folders) if folders else None,
+            'processes': ingest_processes(),
+            'stages': stage_last_runs(),
+            'fetchers': fetchers,
+            'zfs': self.zfs,
+            'pg': self.pg,
+            'pg_t': self.pg_t,
+            'tps': self.tps,
+            'db_growth': self.db_growth,
+            'series': remaining_series(now, remaining, proc_times, arrivals),
+        }
+
+
+def publish(c):
+    t0 = time.time()
+    m = c.collect(t0)
+    m['elapsed'] = time.time() - t0
     write_atomic(f'{OUT_DIR}/index.html', render(m))
     write_atomic(f'{OUT_DIR}/status.json', json.dumps(m, indent=1, default=str))
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    c = Collector(time.time())
+    if '--once' in sys.argv[1:]:
+        publish(c)
+        c.save(time.time())
+        return
+    # systemd stops us with SIGTERM: exit through the finally so the caches are saved.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        while True:
+            t0 = time.time()
+            try:
+                publish(c)
+            except Exception:  # keep serving; the page shows the data going stale
+                traceback.print_exc()
+                sys.stderr.flush()
+            time.sleep(max(0.5, REFRESH - (time.time() - t0)))
+    finally:
+        c.save(time.time())
 
 
 if __name__ == '__main__':
