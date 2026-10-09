@@ -22,6 +22,7 @@ APPID = '281990'
 QUEUE_DIR = f'{BASE}/steam_workshop_data/{APPID}'
 ARCHIVE_DIR = f'{BASE}/archive_steam_workshop_data/{APPID}'
 LOCK_FILE = f'{BASE}/run_periodic_ingest.lock'
+HALT_FILE = f'{BASE}/ingest_halted'  # written by run_periodic_ingest.sh when an ingest fails
 LOG_DIR = f'{BASE}/logs'
 TERRA_QUEUE = '/zpool0/share/terra-mods/steam_workshop_data'
 # First snapshot left unprocessed when the old lock went stale on 2024-02-12;
@@ -312,8 +313,11 @@ def remaining_series(now, remaining_now, proc_times, arrival_times):
     return pts
 
 
-def health(now, remaining, holder, last_done):
+def health(now, remaining, holder, last_done, halted):
     age = now - last_done if last_done else None
+    if halted:
+        return 'critical', 'Halted', (f'Metadata ingest failed on {halted}; the snapshot is left unarchived. '
+                                      f'Fix the cause, then remove {HALT_FILE} to resume.')
     if remaining <= 1:
         return 'good', 'Caught up', 'Nothing waiting beyond the snapshot being fetched.'
     if holder:
@@ -689,7 +693,12 @@ def main():
             'eta_s': remaining / net * 3600 if net > 0 and remaining > 1 else (0 if remaining <= 1 else None)}
 
     holder = lock_held(LOCK_FILE)
-    level, label, detail = health(now, remaining, holder, proc_times[-1] if proc_times else None)
+    try:
+        with open(HALT_FILE) as f:
+            halted = f.read().strip() or 'an unnamed snapshot'
+    except OSError:
+        halted = None
+    level, label, detail = health(now, remaining, holder, proc_times[-1] if proc_times else None, halted)
 
     fetchers = []
     for flabel, newest in (('stellar-mods', max(folders) if folders else newest_snapshot(f'{BASE}/steam_workshop_data')),
