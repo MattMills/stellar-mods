@@ -1,0 +1,9 @@
+[Unit]
+Description=Render the Steam workshop ingest status page (/ingest-status/)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /zpool0/share/stellar-mods/status/ingest_status.py
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=30min
