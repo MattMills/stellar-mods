@@ -26,6 +26,9 @@ BASE = '/zpool0/share/stellar-mods'
 APPID = '281990'
 QUEUE_DIR = f'{BASE}/steam_workshop_data/{APPID}'
 ARCHIVE_DIR = f'{BASE}/archive_steam_workshop_data/{APPID}'
+# Ingested snapshots on their way to ARCHIVE_DIR (zip_completed.sh / stellar-zipper.service)
+COMPLETE_DIR = f'{BASE}/complete/steam_workshop_data/{APPID}'
+UNDER_ZIP_DIR = f'{BASE}/under_zip/steam_workshop_data/{APPID}'
 LOCK_FILE = f'{BASE}/run_periodic_ingest.lock'
 HALT_FILE = f'{BASE}/ingest_halted'  # written by run_periodic_ingest.sh when an ingest fails
 LOG_DIR = f'{BASE}/logs'
@@ -47,7 +50,8 @@ STALE_AFTER = 30      # the page warns when its data is older than this
 
 STAGES = [
     ('steam_workshop.py', 'Steam fetch', None),
-    ('postgres_mod_metadata_ingest.py', 'Metadata ingest', 'postgres_mod_metadata_ingest.py'),
+    ('postgres_batch_ingest.py', 'Batch ingest', 'postgres_batch_ingest.py'),
+    ('postgres_mod_metadata_ingest.py', 'Metadata ingest (per snapshot, retired)', 'postgres_mod_metadata_ingest.py'),
     ('zip', 'Archive snapshot', None),
     ('postgres_preview_download.py', 'Preview download', 'postgres_preview_download.py'),
     ('postgres_mod_download.py', 'Mod download', 'postgres_mod_download.py'),
@@ -111,23 +115,29 @@ def tree_size(path):
     return apparent, disk, files
 
 
-def scan_queue(cache, now):
-    """Every snapshot folder still waiting: {name: {mtime, apparent, disk, files}}."""
+def scan_queue(cache, now, path=QUEUE_DIR):
+    """Every snapshot folder in path: {name: {mtime, ctime, apparent, disk, files}}.
+    In complete/ and under_zip/ the ctime is when the folder was moved there."""
     current, keep = {}, {}
-    with os.scandir(QUEUE_DIR) as it:
+    try:
+        it = os.scandir(path)
+    except FileNotFoundError:
+        return current, keep
+    with it:
         for e in it:
             if not e.is_dir(follow_symlinks=False):
                 continue
             try:
-                mtime = e.stat(follow_symlinks=False).st_mtime
+                st = e.stat(follow_symlinks=False)
                 rec = cache.get(e.name)
-                if not rec or rec['mtime'] != mtime:
+                if not rec or rec['mtime'] != st.st_mtime:  # contents changed: measure again
                     a, d, n = tree_size(e.path)
-                    rec = {'mtime': mtime, 'apparent': a, 'disk': d, 'files': n}
-            except FileNotFoundError:  # zipped away mid-scan
+                    rec = {'mtime': st.st_mtime, 'apparent': a, 'disk': d, 'files': n}
+                rec = {**rec, 'ctime': st.st_ctime}  # a move changes only this; no need to re-measure
+            except FileNotFoundError:  # moved on mid-scan
                 continue
             current[e.name] = rec
-            if now - mtime >= SETTLE:
+            if now - st.st_mtime >= SETTLE:
                 keep[e.name] = rec
     return current, keep
 
@@ -214,8 +224,11 @@ def ingest_processes():
         exe = os.path.basename(args[0])
         stage = os.path.basename(args[1]) if exe.startswith('python') and len(args) > 1 else exe
         if stage in labels:
-            out.append({'stage': stage, 'label': labels[stage], 'pid': int(pid),
-                        'start': start, 'arg': args[-1] if len(args) > 2 else ''})
+            arg = args[-1] if len(args) > 2 else ''
+            if stage == 'postgres_batch_ingest.py' and len(args) > 3:  # python3 script APPID DIR...
+                arg = (f'{len(args) - 3} snapshots: {os.path.basename(args[3].rstrip("/"))}'
+                       f' .. {os.path.basename(args[-1].rstrip("/"))}')
+            out.append({'stage': stage, 'label': labels[stage], 'pid': int(pid), 'start': start, 'arg': arg})
     return sorted(out, key=lambda p: p['start'])
 
 
@@ -694,7 +707,7 @@ def render(m):
 </section>
 
 <div class="tiles">
-  {tile('Processed', fmt_bytes(a['uncompressed']), f"{fmt_int(a['count'])} snapshots, zipped to {fmt_bytes(a['size'])}")}
+  {tile('Processed', fmt_bytes(a['uncompressed']), f"{fmt_int(a['count'])} snapshots; {fmt_int(a['zipped'])} zipped to {fmt_bytes(a['size'])}, {fmt_int(m['zipq']['complete'] + m['zipq']['under_zip'])} waiting for zip")}
   {tile('Throughput', f"{rate['processed_per_h']:.1f}/h", f"{rate['arrived_per_h']:.1f}/h arriving · net {rate['net_per_h']:+.1f}/h (last {fmt_age(rate['window_s'])})")}
   {tile('Time to catch up', eta, eta_sub)}
   {tile('Data reached', esc(reached[:16].replace('T', ' ')) + ' UTC' if reached else '–', 'oldest snapshot still waiting')}
@@ -711,7 +724,9 @@ def render(m):
     <tr><th>Stage</th><th>Last started</th><th class="num">Age</th><th></th></tr>{stages}</table></div></div>
   <div class="card"><h3>Hourly Steam fetches</h3><div class="scroll"><table>
     <tr><th>Fetcher</th><th>Newest snapshot</th><th>Name (UTC)</th></tr>{fetchers}</table></div>
-    <div class="muted" style="margin-top:8px;font-size:12.5px">Ingest lock: {'held' if m['holder'] else 'free'}</div></div>
+    <div class="muted" style="margin-top:8px;font-size:12.5px">Ingest lock: {'held' if m['holder'] else 'free'} ·
+      zip queue: {fmt_int(m['zipq']['complete'])} in complete/, {fmt_int(m['zipq']['under_zip'])} under zip ·
+      zipper {status_chip('good' if m['zipq']['zipper'] == 'active' else 'critical', m['zipq']['zipper'] or 'unknown')}</div></div>
 </div>
 
 <h2>Postgres <span class="muted" style="font-weight:400">· {DB} · queried every {SLOW_EVERY} s, last {fmt_age(m['now'] - m['pg_t'])} ago</span></h2>
@@ -736,6 +751,9 @@ class Collector:
         cache = load_json(f'{STATE_DIR}/cache.json', {})
         self.folder_cache = cache.get('folders', {})
         self.zip_cache = cache.get('zips', {})
+        self.complete_cache = cache.get('complete', {})
+        self.under_zip_cache = cache.get('under_zip', {})
+        self.zipper = None
         self.history = load_history(now)
         self.pg, self.zfs, self.pg_t = {}, [], 0
         self.tps = self.db_growth = None
@@ -745,6 +763,11 @@ class Collector:
 
     def slow(self, now):
         self.pg, self.zfs, self.pg_t = postgres(), zfs_usage(), now
+        try:
+            self.zipper = subprocess.run(['systemctl', 'is-active', 'stellar-zipper.service'],
+                                         capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            self.zipper = 'unknown'
         if 'error' in self.pg:
             return
         commits = (self.pg.get('db') or {}).get('xact_commit')
@@ -759,7 +782,9 @@ class Collector:
 
     def save(self, now):
         """Persist the size caches and add a history sample."""
-        write_atomic(f'{STATE_DIR}/cache.json', json.dumps({'folders': self.folder_cache, 'zips': self.zip_cache}))
+        write_atomic(f'{STATE_DIR}/cache.json', json.dumps({'folders': self.folder_cache, 'zips': self.zip_cache,
+                                                            'complete': self.complete_cache,
+                                                            'under_zip': self.under_zip_cache}))
         if self.sample:
             self.history = [r for r in self.history if now - r['t'] <= HISTORY_KEEP] + [self.sample]
             write_atomic(f'{STATE_DIR}/history.jsonl', ''.join(json.dumps(r) + '\n' for r in self.history))
@@ -768,11 +793,15 @@ class Collector:
     def collect(self, now):
         folders, self.folder_cache = scan_queue(self.folder_cache, now)
         zips, self.zip_cache = scan_archive(self.zip_cache, now)
+        # Ingested and handed to the zipper: processed, as of the move (ctime).
+        complete, self.complete_cache = scan_queue(self.complete_cache, now, COMPLETE_DIR)
+        under_zip, self.under_zip_cache = scan_queue(self.under_zip_cache, now, UNDER_ZIP_DIR)
+        queued = {**complete, **under_zip}
         if now - self.pg_t >= SLOW_EVERY:
             self.slow(now)
 
-        proc_times = sorted(z['ctime'] for z in zips.values())
-        arrivals = [t for t in (snap_ts(n) for n in list(folders) + list(zips)) if t]
+        proc_times = sorted([z['ctime'] for z in zips.values()] + [f['ctime'] for f in queued.values()])
+        arrivals = [t for t in (snap_ts(n) for n in list(folders) + list(zips) + list(queued)) if t]
         remaining = len(folders)
 
         window_start = max(now - RATE_WINDOW, proc_times[0] if proc_times else now - RATE_WINDOW)
@@ -799,8 +828,8 @@ class Collector:
             fetchers.append({'label': flabel, 'level': flevel, 'age': fage, 'newest': newest})
 
         remaining_bytes = sum(f['apparent'] for f in folders.values())
-        processed_bytes = sum(z['uncompressed'] for z in zips.values())
-        self.sample = {'t': round(now), 'remaining': remaining, 'processed': len(zips),
+        processed_bytes = sum(z['uncompressed'] for z in zips.values()) + sum(f['apparent'] for f in queued.values())
+        self.sample = {'t': round(now), 'remaining': remaining, 'processed': len(zips) + len(queued),
                        'remaining_bytes': remaining_bytes, 'processed_bytes': processed_bytes,
                        'db_size': self.pg.get('db_size'), 'commits': (self.pg.get('db') or {}).get('xact_commit')}
         if now - self.saved_t >= SAVE_EVERY:
@@ -811,8 +840,9 @@ class Collector:
             'queue': {'count': remaining, 'apparent': remaining_bytes,
                       'disk': sum(f['disk'] for f in folders.values()),
                       'files': sum(f['files'] for f in folders.values())},
-            'archive': {'count': len(zips), 'uncompressed': processed_bytes,
-                        'size': sum(z['size'] for z in zips.values())},
+            'archive': {'count': len(zips) + len(queued), 'uncompressed': processed_bytes,
+                        'zipped': len(zips), 'size': sum(z['size'] for z in zips.values())},
+            'zipq': {'complete': len(complete), 'under_zip': len(under_zip), 'zipper': self.zipper},
             'rate': rate,
             'health': {'level': level, 'label': label, 'detail': detail},
             'holder': holder,
