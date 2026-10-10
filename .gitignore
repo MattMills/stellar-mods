@@ -10,3 +10,4 @@ SECRET_STEAM_API_KEY
 ingest_halted
 complete/
 under_zip/
+pending_zip/

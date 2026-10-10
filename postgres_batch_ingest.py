@@ -24,16 +24,20 @@ cannot duplicate mod_stats rows. Snapshots that already have an ingest_event
 are skipped, so re-running a batch after a crash between commit and zip is
 safe.
 
-usage: postgres_batch_ingest.py APPID SNAPSHOT_DIR [SNAPSHOT_DIR ...]
-       (directories in processing order; $INGEST_DB, default stellar-mods;
-        $INGEST_LOADERS, default 8)
+usage: postgres_batch_ingest.py APPID SNAPSHOT [SNAPSHOT ...]
+       (snapshot folders or their zips, in processing order; a zip is read in
+        one go and unpacked under $INGEST_WORK, default /dev/shm;
+        $INGEST_DB, default stellar-mods; $INGEST_LOADERS, default 8)
 """
 import logging
 import os
 import platform
+import shutil
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -42,6 +46,9 @@ import psycopg2.extras
 
 DB = os.environ.get('INGEST_DB', 'stellar-mods')
 LOADERS = int(os.environ.get('INGEST_LOADERS', '8'))  # parallel parsing connections
+# A zipped snapshot is read in one go and unpacked here (RAM) for pg_read_file.
+WORK_ROOT = os.environ.get('INGEST_WORK', '/dev/shm')
+DATA_FOLDER = 'steam_workshop_data'  # ingest_event folders read steam_workshop_data/<appid>/<snap>/
 # ingest_event types that record a fully ingested snapshot folder
 INGEST_TYPES = ('./postgres_mod_metadata_ingest.py', 'postgres_mod_metadata_ingest.py',
                 './postgres_batch_ingest.py', 'postgres_batch_ingest.py')
@@ -284,6 +291,12 @@ group by s.snap_idx, s.snap, s.file_count order by s.snap_idx;
 """
 
 
+def snap_name(path):
+    """Snapshot name of a folder or of its zip: the UTC fetch time, e.g. 2024-09-05T09:05:01.791723."""
+    base = os.path.basename(path.rstrip('/'))
+    return base[:-4] if base.endswith('.zip') else base
+
+
 def setup_log(start):
     log = logging.getLogger('batch_ingest')
     log.setLevel(logging.INFO)
@@ -299,10 +312,12 @@ def setup_log(start):
 def main():
     if len(sys.argv) < 3:
         sys.exit('usage: postgres_batch_ingest.py APPID SNAPSHOT_DIR [SNAPSHOT_DIR ...]')
+    appid = sys.argv[1]
     given = [d.rstrip('/') for d in sys.argv[2:]]
-    missing = [d for d in given if not os.path.isdir(d)]
+    missing = [d for d in given if not (os.path.isdir(d) or (d.endswith('.zip') and os.path.isfile(d)))]
     if missing:
-        sys.exit(f'not a directory: {missing}')
+        sys.exit(f'not a snapshot folder or zip: {missing}')
+    os.umask(0o022)  # unpacked pages must be readable by the postgres server process
     start = datetime.now()
     log = setup_log(start)
     log.info('start: %d snapshots, %s .. %s', len(given), os.path.basename(given[0]), os.path.basename(given[-1]))
@@ -317,9 +332,9 @@ def main():
     # the loop still archives it.
     cur.execute("select distinct substring(config_metadata->>'folder' from '([^/]+)/?$') from ingest_event "
                 "where type in %s and config_metadata->>'folder' like any(%s)",
-                (INGEST_TYPES, ['%/' + os.path.basename(d) + '/' for d in given]))
+                (INGEST_TYPES, ['%/' + snap_name(d) + '/' for d in given]))
     done = {r[0] for r in cur.fetchall()}
-    dirs = [d for d in given if os.path.basename(d) not in done]
+    dirs = [d for d in given if snap_name(d) not in done]
     if done:
         log.info('already ingested, archive only: %s', ' '.join(sorted(done)))
     if not dirs:
@@ -333,19 +348,35 @@ def main():
     # the staging table. Nothing shared is written here, so order is irrelevant.
     t = time.time()
     local, conns, conns_lock = threading.local(), [], threading.Lock()
+    work = tempfile.mkdtemp(prefix='stellar-ingest-', dir=WORK_ROOT)
+    os.chmod(work, 0o755)
 
     def load(job):
-        i, d = job
+        i, p = job
         if not hasattr(local, 'conn'):
             local.conn = psycopg2.connect(f'dbname={DB} user=postgres')
             with conns_lock:
                 conns.append(local.conn)
             with local.conn.cursor() as k:
                 k.execute(SQL_LOADER_FN, {'mod_keys': MOD_KEYS})
-        with local.conn.cursor() as k:
-            k.execute('select pg_temp.load_snapshot(%s, %s)', (i, os.path.abspath(d)))
-            n = k.fetchone()[0]
-        local.conn.commit()
+        d = os.path.abspath(p)
+        if p.endswith('.zip'):  # one sequential read, unpacked to RAM under the snapshot's own name
+            d = os.path.join(work, snap_name(p))
+            os.mkdir(d)
+            with zipfile.ZipFile(p) as z:
+                for info in z.infolist():
+                    name = os.path.basename(info.filename)
+                    if name and not info.is_dir():
+                        with z.open(info) as src, open(os.path.join(d, name), 'wb') as dst:
+                            shutil.copyfileobj(src, dst, 1 << 20)
+        try:
+            with local.conn.cursor() as k:
+                k.execute('select pg_temp.load_snapshot(%s, %s)', (i, d))
+                n = k.fetchone()[0]
+            local.conn.commit()
+        finally:
+            if d.startswith(work):
+                shutil.rmtree(d, ignore_errors=True)
         return n
 
     try:
@@ -354,6 +385,7 @@ def main():
     finally:
         for c in conns:
             c.close()
+        shutil.rmtree(work, ignore_errors=True)
     timings.append(('read+parse', time.time() - t))
 
     # Merge, in batch order, as one transaction.
@@ -364,7 +396,7 @@ def main():
 
     step('setup', SQL_MERGE_SETUP)
     psycopg2.extras.execute_values(cur, 'insert into snaps values %s',
-                                   [(i, os.path.basename(d), n) for i, (d, n) in enumerate(zip(dirs, file_counts))])
+                                   [(i, snap_name(d), n) for i, (d, n) in enumerate(zip(dirs, file_counts))])
     step('dict state', SQL_EXPAND)
     step('mods', SQL_MODS)
     step('stats+files', SQL_STATS_FILES, {'sentinel': SENTINEL_PREVIEW})
@@ -379,7 +411,9 @@ def main():
                     'values (%s, %s, %s, %s, %s)',
                     (start, end, stats, sys.argv[0],
                      {'host': platform.node(), 'python_version': platform.python_version(), 'argv': sys.argv,
-                      'pid': os.getpid(), 'folder': dirs[snap_idx] + '/', 'batch': len(dirs)}))
+                      'pid': os.getpid(), 'batch': len(dirs),
+                      'folder': (f'{DATA_FOLDER}/{appid}/{snap}/' if dirs[snap_idx].endswith('.zip')
+                                 else dirs[snap_idx] + '/')}))
         log.info('%s: %s', snap, stats)
     cur.execute('truncate ingest_stage_occ')
     t = time.time()
