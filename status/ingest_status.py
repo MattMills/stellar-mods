@@ -26,7 +26,9 @@ BASE = '/zpool0/share/stellar-mods'
 APPID = '281990'
 QUEUE_DIR = f'{BASE}/steam_workshop_data/{APPID}'
 ARCHIVE_DIR = f'{BASE}/archive_steam_workshop_data/{APPID}'
-# Ingested snapshots on their way to ARCHIVE_DIR (zip_completed.sh / stellar-zipper.service)
+# Zipped by run_periodic_ingest.sh, waiting for ingest (renamed into ARCHIVE_DIR once ingested)
+PENDING_DIR = f'{BASE}/pending_zip/steam_workshop_data/{APPID}'
+# Ingested snapshots on their way to ARCHIVE_DIR (zip_completed.sh / stellar-zipper.service, retired)
 COMPLETE_DIR = f'{BASE}/complete/steam_workshop_data/{APPID}'
 UNDER_ZIP_DIR = f'{BASE}/under_zip/steam_workshop_data/{APPID}'
 LOCK_FILE = f'{BASE}/run_periodic_ingest.lock'
@@ -142,15 +144,18 @@ def scan_queue(cache, now, path=QUEUE_DIR):
     return current, keep
 
 
-def scan_archive(cache, now):
-    """Catch-up archives: {name: {ctime, size, uncompressed, files}}.
+def scan_archive(cache, now, path=ARCHIVE_DIR, start=BACKLOG_START + '.zip'):
+    """Snapshot zips in path named from start on: {name: {ctime, size, uncompressed, files}}.
 
-    The ingest zips with -o, which backdates mtime to the snapshot, so the
-    time a snapshot was processed is the zip's ctime.
+    zip -o backdates mtime to the snapshot; ctime is when the zip was written
+    or, for an ingested snapshot, renamed into the archive.
     """
     current, keep = {}, {}
-    start = BACKLOG_START + '.zip'
-    with os.scandir(ARCHIVE_DIR) as it:
+    try:
+        it = os.scandir(path)
+    except FileNotFoundError:
+        return current, keep
+    with it:
         for e in it:
             if not e.name.endswith('.zip') or e.name < start:
                 continue
@@ -698,7 +703,7 @@ def render(m):
 <section class="card hero">
   <div class="top">
     <div><div class="label">Remaining backlog</div><div class="big">{fmt_bytes(q['apparent'])}</div>
-      <div class="ink2">{fmt_int(q['count'])} snapshots · {fmt_bytes(q['disk'])} on disk · {fmt_int(q['files'])} files</div></div>
+      <div class="ink2">{fmt_int(q['count'])} snapshots ({fmt_int(q['folders'])} folders, {fmt_int(q['zipped'])} zipped) · {fmt_bytes(q['disk'])} on disk · {fmt_int(q['files'])} files</div></div>
     <div class="state">{status_chip(h['level'], h['label'])}<div class="detail">{esc(h['detail'])}</div></div>
   </div>
   <div class="meter" role="img" aria-label="{pct:.1f}% of the backlog processed"><span style="width:{pct:.2f}%"></span></div>
@@ -725,8 +730,9 @@ def render(m):
   <div class="card"><h3>Hourly Steam fetches</h3><div class="scroll"><table>
     <tr><th>Fetcher</th><th>Newest snapshot</th><th>Name (UTC)</th></tr>{fetchers}</table></div>
     <div class="muted" style="margin-top:8px;font-size:12.5px">Ingest lock: {'held' if m['holder'] else 'free'} ·
-      zip queue: {fmt_int(m['zipq']['complete'])} in complete/, {fmt_int(m['zipq']['under_zip'])} under zip ·
-      zipper {status_chip('good' if m['zipq']['zipper'] == 'active' else 'critical', m['zipq']['zipper'] or 'unknown')}</div></div>
+      zip first: {fmt_int(q['folders'])} folders to zip, {fmt_int(q['zipped'])} zips waiting for ingest{
+      f" · retired zipper queue: {fmt_int(m['zipq']['complete'])} in complete/, {fmt_int(m['zipq']['under_zip'])} under zip"
+      if m['zipq']['complete'] or m['zipq']['under_zip'] else ''}</div></div>
 </div>
 
 <h2>Postgres <span class="muted" style="font-weight:400">· {DB} · queried every {SLOW_EVERY} s, last {fmt_age(m['now'] - m['pg_t'])} ago</span></h2>
@@ -751,6 +757,7 @@ class Collector:
         cache = load_json(f'{STATE_DIR}/cache.json', {})
         self.folder_cache = cache.get('folders', {})
         self.zip_cache = cache.get('zips', {})
+        self.pending_cache = cache.get('pending', {})
         self.complete_cache = cache.get('complete', {})
         self.under_zip_cache = cache.get('under_zip', {})
         self.zipper = None
@@ -783,6 +790,7 @@ class Collector:
     def save(self, now):
         """Persist the size caches and add a history sample."""
         write_atomic(f'{STATE_DIR}/cache.json', json.dumps({'folders': self.folder_cache, 'zips': self.zip_cache,
+                                                            'pending': self.pending_cache,
                                                             'complete': self.complete_cache,
                                                             'under_zip': self.under_zip_cache}))
         if self.sample:
@@ -793,6 +801,8 @@ class Collector:
     def collect(self, now):
         folders, self.folder_cache = scan_queue(self.folder_cache, now)
         zips, self.zip_cache = scan_archive(self.zip_cache, now)
+        # Zipped but not ingested yet: still part of the backlog.
+        pending, self.pending_cache = scan_archive(self.pending_cache, now, PENDING_DIR, '')
         # Ingested and handed to the zipper: processed, as of the move (ctime).
         complete, self.complete_cache = scan_queue(self.complete_cache, now, COMPLETE_DIR)
         under_zip, self.under_zip_cache = scan_queue(self.under_zip_cache, now, UNDER_ZIP_DIR)
@@ -801,8 +811,8 @@ class Collector:
             self.slow(now)
 
         proc_times = sorted([z['ctime'] for z in zips.values()] + [f['ctime'] for f in queued.values()])
-        arrivals = [t for t in (snap_ts(n) for n in list(folders) + list(zips) + list(queued)) if t]
-        remaining = len(folders)
+        arrivals = [t for t in (snap_ts(n) for n in list(folders) + list(pending) + list(zips) + list(queued)) if t]
+        remaining = len(folders) + len(pending)
 
         window_start = max(now - RATE_WINDOW, proc_times[0] if proc_times else now - RATE_WINDOW)
         window = max(now - window_start, 1)
@@ -822,12 +832,14 @@ class Collector:
         level, label, detail = health(now, remaining, holder, proc_times[-1] if proc_times else None, halted)
 
         fetchers = []
-        for flabel, newest in (('stellar-mods', max(folders) if folders else newest_snapshot(f'{BASE}/steam_workshop_data')),
+        # A fetched folder is zipped within ~20 minutes, so its newest snapshot may already be a zip.
+        names = [n for n in list(folders) + list(pending) + list(zips) + list(queued) if snap_ts(n)]
+        for flabel, newest in (('stellar-mods', max(names) if names else newest_snapshot(f'{BASE}/steam_workshop_data')),
                                ('terra-mods', newest_snapshot(TERRA_QUEUE))):
             flevel, fage, _ = fetch_health(now, newest)
             fetchers.append({'label': flabel, 'level': flevel, 'age': fage, 'newest': newest})
 
-        remaining_bytes = sum(f['apparent'] for f in folders.values())
+        remaining_bytes = sum(f['apparent'] for f in folders.values()) + sum(z['uncompressed'] for z in pending.values())
         processed_bytes = sum(z['uncompressed'] for z in zips.values()) + sum(f['apparent'] for f in queued.values())
         self.sample = {'t': round(now), 'remaining': remaining, 'processed': len(zips) + len(queued),
                        'remaining_bytes': remaining_bytes, 'processed_bytes': processed_bytes,
@@ -838,8 +850,9 @@ class Collector:
         return {
             'now': now,
             'queue': {'count': remaining, 'apparent': remaining_bytes,
-                      'disk': sum(f['disk'] for f in folders.values()),
-                      'files': sum(f['files'] for f in folders.values())},
+                      'disk': sum(f['disk'] for f in folders.values()) + sum(z['size'] for z in pending.values()),
+                      'files': sum(f['files'] for f in folders.values()) + sum(z['files'] for z in pending.values()),
+                      'folders': len(folders), 'zipped': len(pending)},
             'archive': {'count': len(zips) + len(queued), 'uncompressed': processed_bytes,
                         'zipped': len(zips), 'size': sum(z['size'] for z in zips.values())},
             'zipq': {'complete': len(complete), 'under_zip': len(under_zip), 'zipper': self.zipper},
@@ -847,7 +860,7 @@ class Collector:
             'health': {'level': level, 'label': label, 'detail': detail},
             'holder': holder,
             'halted': halted,
-            'data_reached': min(folders) if folders else None,
+            'data_reached': min(list(folders) + list(pending)) if folders or pending else None,
             'processes': ingest_processes(),
             'stages': stage_last_runs(),
             'fetchers': fetchers,
